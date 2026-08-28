@@ -18,8 +18,9 @@
 namespace lmx::runtime {
 
 #define LMX_LOCAL_VAR_COUNT 256
-#define LMX_CALLSTACK_MAX_COUNT 100
+#define LMX_CALLSTACK_MAX_COUNT 4096
 #define LMX_VM_REG_COUNT 256
+#define LMX_GLOBAL_VAR_COUNT 65536
 
 struct Frame {
     Frame* last;
@@ -34,6 +35,7 @@ class LaminaVM {
     Value* stack_storage;
     Value* stack;
     Value* regs;
+    Value* global_vars;
     Frame* cur_frame{};
     LmGCAllocator allocator{};
 
@@ -43,7 +45,6 @@ class LaminaVM {
     std::size_t invoke_depth = 0;
 
     Value execute(const uint8_t* start, Frame* stop_frame);
-
 
 
     LMX_INLINE static void native_arg(DCCallVM* call_vm, const ValueKind k, const Value* v) noexcept {

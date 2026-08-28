@@ -69,6 +69,9 @@ MirSetBinaryExpr::MirSetBinaryExpr(const runtime::Opcode::Opcode opcode,
                                    std::shared_ptr<MirExpr> rhs) noexcept
     : MirOperateExpr(opcode), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
 
+MirFPowExpr::MirFPowExpr(std::shared_ptr<MirExpr> lhs, std::shared_ptr<MirExpr> rhs) noexcept
+    : MirOperateExpr(runtime::Opcode::Opcode::FPow), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+
 MirINegExpr::MirINegExpr(std::shared_ptr<MirExpr> e) noexcept
     : MirOperateExpr(runtime::Opcode::Opcode::INeg), e(std::move(e)) {}
 

@@ -150,6 +150,10 @@ struct MirSetBinaryExpr : MirOperateExpr {
                      std::shared_ptr<MirExpr> lhs,
                      std::shared_ptr<MirExpr> rhs) noexcept;
 };
+struct MirFPowExpr : MirOperateExpr {
+    std::shared_ptr<MirExpr> lhs, rhs;
+    explicit MirFPowExpr(std::shared_ptr<MirExpr> lhs, std::shared_ptr<MirExpr> rhs) noexcept;
+};
 struct MirINegExpr : MirOperateExpr {
     std::shared_ptr<MirExpr> e;
     explicit MirINegExpr(std::shared_ptr<MirExpr> e) noexcept;
@@ -315,6 +319,19 @@ struct MirGetModuleAttrExpr : MirOperateExpr {
     explicit MirGetModuleAttrExpr(std::shared_ptr<MirRefExpr> mod, std::string mod_name, std::string name) noexcept
         : MirOperateExpr(runtime::Opcode::Opcode::GetModuleAttr), mod(std::move(mod)),
           mod_name(std::move(mod_name)), name(std::move(name)) {}
+};
+
+struct MirFuncCreateExpr : MirOperateExpr {
+    std::string func_name;
+    // 按声明顺序存储 capture 变量名字（就是 outer scope 对应的 Identifier 字符串）。
+    // assembler FuncCreate 发射时用这些名字查当前上下文的 vals local-var slot，
+    // 编码成 closure_layout，VM 端 FuncCreate 再按 slot 从 outer frame 读取打包。
+    std::vector<std::string> cap_names;
+    explicit MirFuncCreateExpr(std::string func_name,
+                               std::vector<std::string> caps = {}) noexcept
+        : MirOperateExpr(runtime::Opcode::Opcode::FuncCreate),
+          func_name(std::move(func_name)),
+          cap_names(std::move(caps)) {}
 };
 
 struct MirAdtNewExpr : MirOperateExpr {

@@ -4,10 +4,17 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <string_view>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "object/fraction.hpp"
 #include "object/adt.hpp"
 #include "object/literal.hpp"
+#include "object/closure.hpp"
 #include <cmath>
 #include <iostream>
 #include <ostream>
@@ -23,11 +30,13 @@ thread_local LaminaVM* active_vm = nullptr;
 LaminaVM::LaminaVM(const int argc, char **argv) noexcept :
     stack(new Value[LMX_VM_REG_COUNT * LMX_CALLSTACK_MAX_COUNT]),
     regs(stack),
+    global_vars(new Value[LMX_GLOBAL_VAR_COUNT]),
     args(argv, argc),
     call_vms{dcNewCallVM(4096)} {}
 
 LaminaVM::~LaminaVM() noexcept {
     delete[] stack;
+    delete[] global_vars;
     for (const auto frames : free_frames) delete frames;
     delete cur_frame;
     for (auto* call_vm : call_vms) dcFree(call_vm);
@@ -130,7 +139,7 @@ static const void* dispatch[] = {\
     &&opIfTrue, &&opIfFalse,\
     &&opLGet, &&opLSet,\
     &&opGGet, &&opGSet,\
-    &&opFAdd, &&opFSub, &&opFMul, &&opFDiv, &&opFMod, &&opFNeg,\
+    &&opFAdd, &&opFPow, &&opFSub, &&opFMul, &&opFDiv, &&opFMod, &&opFNeg,\
     &&opMovRR,&&opCall, &&opAnd, &&opOr,\
     &&opFCmpEq, &&opFCmpNe, &&opFCmpLt, &&opFCmpLe, &&opFCmpGt, &&opFCmpGe, \
     &&opGetModule, &&opGetModuleAttr, &&opGetFunc,\
@@ -394,13 +403,81 @@ Value LaminaVM::execute(const uint8_t* ip, Frame* stop_frame) {
         VM_NEXT
     }
 
+    VM_LABEL(FPow) {
+        const auto base = as_fraction(regs[ip[2]]);
+        const auto exp_frac = as_fraction(regs[ip[3]]);
+
+        if (exp_frac.den == 1) {
+            const int32_t e = exp_frac.num;
+            if (e >= 0) {
+                const auto num = static_cast<int32_t>(std::pow(base.num, e));
+                const auto den = static_cast<int32_t>(std::pow(base.den, e));
+                regs[ip[1]] = Fraction(num, den);
+            } else {
+                const int32_t abs_e = -e;
+                const auto num = static_cast<int32_t>(std::pow(base.den, abs_e));
+                const auto den = static_cast<int32_t>(std::pow(base.num, abs_e));
+                regs[ip[1]] = Fraction(num, den);
+            }
+        } else {
+            const double b = static_cast<double>(base.num) / static_cast<double>(base.den);
+            const double e = static_cast<double>(exp_frac.num) / static_cast<double>(exp_frac.den);
+            regs[ip[1]] = std::pow(b, e);
+        }
+        VM_NEXT
+    }
+
     VM_LABEL(INeg) {
         regs[ip[1]] = -regs[ip[2]];
         VM_NEXT
     }
 
-    VM_LABEL(FuncCreate) {
-        uint16_t code_idx = read_u16(ip + 2);
+    VM_LABEL(FuncCreate) { // create lambda func
+        const uint16_t layout_idx = read_u16(ip + 2);
+        if (layout_idx >= cur_frame->mod->closure_layouts.size()) {
+            regs[ip[1]] = nullptr;
+            VM_NEXT
+        }
+        const auto& layout = cur_frame->mod->closure_layouts[layout_idx];
+        if (layout.size() < 3) {
+            regs[ip[1]] = nullptr;
+            VM_NEXT
+        }
+        const uint16_t func_idx = static_cast<uint16_t>(layout[0]) | (static_cast<uint16_t>(layout[1]) << 8);
+        const uint8_t cap_count = layout[2];
+        if (layout.size() < static_cast<size_t>(3 + cap_count)) {
+            regs[ip[1]] = nullptr;
+            VM_NEXT
+        }
+        if (func_idx >= cur_frame->mod->funcs.size()) {
+            regs[ip[1]] = nullptr;
+            VM_NEXT
+        }
+        auto* func = &cur_frame->mod->funcs[func_idx];
+
+
+        Value* capture_values_arr = nullptr;
+        if (cap_count > 0) {
+            constexpr size_t val_sz = sizeof(Value);
+            capture_values_arr = static_cast<Value*>(std::malloc(static_cast<size_t>(cap_count) * val_sz));
+            if (!capture_values_arr) {
+                regs[ip[1]] = nullptr;
+                VM_NEXT
+            }
+            for (uint8_t i = 0; i < cap_count; ++i) {
+                const uint8_t slot = layout[3 + i];
+                ::new (static_cast<void*>(&capture_values_arr[i])) Value(cur_frame->local_vars[slot]);
+            }
+        }
+
+        ClosureObj* closure = ClosureObj::make(func, cap_count, capture_values_arr);
+        if (capture_values_arr) {
+            for (uint8_t i = 0; i < cap_count; ++i) {
+                capture_values_arr[i].~Value();
+            }
+            std::free(capture_values_arr);
+        }
+        regs[ip[1]] = Value(static_cast<Object*>(closure), ValueKind::Obj);
         VM_NEXT
     }
 
@@ -416,6 +493,9 @@ Value LaminaVM::execute(const uint8_t* ip, Frame* stop_frame) {
 
     VM_LABEL(CallFast) {
         const auto* func = &cur_frame->mod->funcs[read_u16(ip + 1)];
+        // #region debug-point B:callfast-layout
+     
+        // #endregion
         new_frame(this, func->mod, ip + 4);
         for (uint8_t i = 0; i < ip[3]; ++i) {
             cur_frame->local_vars[i] = regs[LMX_VM_REG_COUNT - 1 - i];
@@ -501,10 +581,12 @@ Value LaminaVM::execute(const uint8_t* ip, Frame* stop_frame) {
     }
 
     VM_LABEL(GGet) {
+        regs[ip[1]] = global_vars[read_u16(ip + 2)];
         VM_NEXT
     }
 
     VM_LABEL(GSet) {
+        global_vars[read_u16(ip + 2)] = regs[ip[1]];
         VM_NEXT
     }
 
@@ -554,11 +636,36 @@ Value LaminaVM::execute(const uint8_t* ip, Frame* stop_frame) {
         VM_NEXT
     }
     VM_LABEL(Call) {
-        const auto* func = static_cast<const FuncObj*>(regs[ip[1]].c_ptr);
+        const Value& callable = regs[ip[1]];
+        const FuncObj* func;
+        uint32_t cap_count = 0;
+        const Value* caps = nullptr;
+
+
+        if (callable.kind == ValueKind::Obj && callable.obj && callable.obj->get_kind() == ObjectKind::Closure) {
+            const auto* closure = static_cast<const ClosureObj*>(callable.obj);
+            func = closure->func;
+            cap_count = closure->cap_count;
+            caps = closure->caps;
+        } else {
+            func = static_cast<const FuncObj*>(callable.c_ptr);
+        }
+        // #region debug-point B:call-layout
+       
+        // #endregion
+        if (!func) {
+            VM_ERROR(RuntimeErrorType::ModuleLoad,
+                "VM Call: null callable (kind=0x" + std::to_string((unsigned)callable.kind) +
+                ", c_ptr=nullptr, obj=" + (callable.obj ? ("kind=" + std::to_string((unsigned)callable.obj->get_kind())) : "nullptr") + ")");
+        }
         new_frame(this, func->mod, ip + 4);
 
-        for (uint8_t i = 0; i < ip[2]; ++i) {
-            cur_frame->local_vars[i] = regs[LMX_VM_REG_COUNT - 1 - i];
+        const uint8_t user_argc = ip[2];
+        for (uint32_t i = 0; i < cap_count; ++i) {
+            cur_frame->local_vars[i] = caps[i];
+        }
+        for (uint8_t i = 0; i < user_argc; ++i) {
+            cur_frame->local_vars[cap_count + i] = regs[LMX_VM_REG_COUNT - 1 - i];
         }
 
         regs += LMX_VM_REG_COUNT;

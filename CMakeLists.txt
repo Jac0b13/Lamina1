@@ -146,6 +146,7 @@ set_target_properties(lamina_shared PROPERTIES
 target_link_libraries(lamina_shared PRIVATE
         dyncall_s
         dynload_s
+        ${CMAKE_DL_LIBS}
 )
 
 set(_lmx_saved_build_testing "${BUILD_TESTING}")
@@ -255,20 +256,17 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
             -fno-plt -fvisibility=hidden
             -funroll-loops -fomit-frame-pointer
             -ffast-math -fno-math-errno
-            -flto
             -fno-semantic-interposition
-            -fmerge-all-constants
             -fpeel-loops -fsplit-loops -fpredictive-commoning
             -fipa-cp-clone -ftree-vectorize
             -fdata-sections -ffunction-sections
             -falign-loops=32 -falign-jumps=32 -falign-functions=32
             -frename-registers -fprefetch-loop-arrays
-            -fipa-pta
             -fno-stack-protector -fno-stack-clash-protection
-            -fcf-protection=none #-fzero-init-padding-bits=unions
+            -fcf-protection=none
             -U_FORTIFY_SOURCE
     )
-    set(LMX_LINK_FLAGS -flto -s -Wl,--gc-sections -Wl,-O3 -Wl,--as-needed)
+    set(LMX_LINK_FLAGS -s -Wl,--gc-sections -Wl,-O3 -Wl,--as-needed)
 elseif (APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(STATUS "Use Apple Clang toolchain compiling")
     set(LMX_PERF_FLAGS

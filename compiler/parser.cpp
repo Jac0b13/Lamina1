@@ -297,6 +297,49 @@ std::shared_ptr<ExprNode> Parser::parse_set_literal() noexcept {
         line, col, LiteralPayloadNode::Kind::Set, std::move(elements));
 }
 
+std::shared_ptr<ExprNode> Parser::parse_lambda() noexcept {
+    size_t line = cur().line, col = cur().col;
+    auto psline = cur().line, pscol = cur().col;
+    decltype(ParamsDeclNode::stmts) params;
+
+    if (!match(TokenType::BAR)) {
+        do {
+            auto pid = cur().text;
+            consume(TokenType::IDENTIFIER, "parameter name");
+            std::shared_ptr<Type> type;
+            if (!match(TokenType::COMMA) && !match(TokenType::BAR)) {
+                type = parse_type();
+            } else {
+                type = type_pool.unknown();
+            }
+            params.emplace_back(pid, type);
+            if (match(TokenType::BAR)) {
+                break;
+            }
+        } while (consume(TokenType::COMMA, ","));
+    }
+    consume(TokenType::BAR, "|");
+
+    if (match(TokenType::ARROW)) {
+        advance();
+    } else {
+        throw_error(ErrorType::Parse, "expected arrow", cur().line, cur().col);
+    }
+    std::shared_ptr<ExprNode> body;
+    if (match(TokenType::LBRACE)) {
+        throw_error(ErrorType::Parse,
+            "lambda body must be a single expression, not a block `{}`; use `|...| -> expr` instead",
+            cur().line, cur().col);
+    }
+    body = parse_expr();
+    if (!body) {
+        throw_error(ErrorType::Parse, "expected lambda body", cur().line, cur().col);
+    }
+    return std::make_shared<LambdaExprNode>(line, col,
+        std::make_shared<ParamsDeclNode>(psline, pscol, std::move(params)),
+        body);
+}
+
 std::shared_ptr<ExprNode> Parser::parse_primary() noexcept {
     size_t line = cur().line, col = cur().col;
     std::shared_ptr<ExprNode> primary;
@@ -445,10 +488,14 @@ std::shared_ptr<ExprNode> Parser::parse_primary() noexcept {
         primary = parse_block();
         break;
     }
+    case TokenType::BAR: {
+        advance();
+        primary = parse_lambda();
+        break;
+    }
     default: {
         throw_error(ErrorType::Parse, "`" + cur().text + "` is wrong primary token", cur().line, cur().col);
         if (pos <= tokens.size()) advance();
-        return nullptr;
     }
     }
 
@@ -931,6 +978,7 @@ std::shared_ptr<StmtNode> Parser::parse_func() noexcept {
         return_type = parse_type();
     }
     else return_type = type_pool.unknown();
+    
     if (match(TokenType::ASSIGN)) {
         if (Type::is_null_type(return_type.get())) {
             throw_error(ErrorType::Parse, "native function declare must be have return_type declare", line, col);
@@ -946,12 +994,13 @@ std::shared_ptr<StmtNode> Parser::parse_func() noexcept {
         return parse_stmt();
     }
     auto body = std::static_pointer_cast<BlockExprNode>(parse_block());
+  
     frame_count--;
     return std::make_shared<FuncImplNode>(
         line, col, id,
         std::make_shared<ParamsDeclNode>(psline, pscol, params),
         return_type, body
-        );
+    );
 }
 
 std::shared_ptr<Type> Parser::parse_type() noexcept {

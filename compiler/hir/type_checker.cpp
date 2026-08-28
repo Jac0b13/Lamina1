@@ -5,13 +5,1043 @@
 #include <functional>
 #include <ranges>
 #include <limits>
+#include <sstream>
 #include <string_view>
 #include <unordered_set>
-
+#include "../ast/ast.hpp"
 #include "../error.hpp"
-
+#include "../mir/mir_builder.hpp"
 using namespace lmx;
 using namespace lmx::hir;
+
+
+using namespace lmx::mir;
+namespace lmx::hir{
+
+static thread_local std::unordered_set<uint64_t> g_mu_head_ids;
+
+static bool is_recursive_mu_head(TypeVariable* tv) noexcept {
+    if (!tv) return false;
+    uint64_t id = tv->id;
+    if (g_mu_head_ids.count(id)) return true;
+    if (!tv->binding) return false;
+
+    std::unordered_set<const Type*> seen_structural;
+    std::unordered_set<uint64_t> on_stack_tv;
+    std::unordered_set<uint64_t> visited_tv;
+    bool found_cycle = false;
+
+    std::function<void(const std::shared_ptr<Type>&)> go;
+    std::function<void(TypeVariable*)> go_tv;
+
+    go_tv = [&](TypeVariable* x) {
+        if (!x) return;
+        uint64_t xid = x->id;
+        if (found_cycle) return;
+        if (on_stack_tv.count(xid)) { found_cycle = true; return; }
+        if (visited_tv.count(xid)) return;
+        on_stack_tv.insert(xid);
+        visited_tv.insert(xid);
+        if (x->binding) go(x->binding);
+        on_stack_tv.erase(xid);
+    };
+    go = [&](const std::shared_ptr<Type>& x) {
+        if (found_cycle) return;
+        auto r = x;
+        while (r && r->kind == TypeKind::TypeVariable) {
+            auto* rv = static_cast<TypeVariable*>(r.get());
+            go_tv(rv);
+            if (found_cycle) return;
+            if (!rv->binding) break;
+            r = rv->binding;
+        }
+        if (!r) return;
+        if (r->kind == TypeKind::TypeVariable) return;
+        if (!seen_structural.insert(r.get()).second) return;
+        switch (r->kind) {
+        case TypeKind::Function: {
+            auto f = std::static_pointer_cast<FunctionType>(r);
+            for (const auto& p: f->params_ty) go(p);
+            if (found_cycle) return;
+            go(f->ret_ty);
+            return;
+        }
+        case TypeKind::LambdaFunction: {
+            auto f = std::static_pointer_cast<LambdaFunctionType>(r);
+            for (const auto& p: f->params_ty) go(p);
+            if (found_cycle) return;
+            go(f->ret_ty);
+            if (found_cycle) return;
+            for (const auto& c: f->capture_tys) go(c);
+            return;
+        }
+        case TypeKind::NativeFunction: {
+            auto f = std::static_pointer_cast<NativeFunctionType>(r);
+            for (const auto& p: f->params_ty) go(p);
+            if (found_cycle) return;
+            go(f->ret_ty);
+            return;
+        }
+        case TypeKind::Array: go(std::static_pointer_cast<ArrayType>(r)->type); return;
+        case TypeKind::Tuple: {
+            auto f = std::static_pointer_cast<TupleType>(r);
+            for (const auto& e: f->tys) { go(e); if (found_cycle) return; }
+            return;
+        }
+        case TypeKind::Nullable: go(std::static_pointer_cast<NullableType>(r)->value_type); return;
+        case TypeKind::Named: {
+            auto f = std::static_pointer_cast<NamedType>(r);
+            for (const auto& a: f->args) { go(a); if (found_cycle) return; }
+            return;
+        }
+        default: return;
+        }
+    };
+
+    go_tv(tv);
+   
+    if (found_cycle) {
+        g_mu_head_ids.insert(id);
+        for (uint64_t v: visited_tv) g_mu_head_ids.insert(v);
+    }
+    return found_cycle;
+}
+
+static void mark_mu_head(uint64_t id) noexcept {
+    g_mu_head_ids.insert(id);
+}
+
+std::shared_ptr<Type> resolve_hm(const std::shared_ptr<Type>& type) noexcept {
+    if (!type) return type;
+    if (type->kind == TypeKind::TypeVariable) {
+        auto tv = std::static_pointer_cast<TypeVariable>(type);
+        if (tv->binding) {
+            if (is_recursive_mu_head(tv.get())) return type;
+            auto repr = resolve_hm(tv->binding);
+            if (!repr || repr->kind != TypeKind::TypeVariable ||
+                !is_recursive_mu_head(std::static_pointer_cast<TypeVariable>(repr).get())) {
+                tv->binding = repr;
+            }
+            return repr;
+        }
+        return type;
+    }
+    return type;
+}
+static std::pair<std::shared_ptr<Type>, std::vector<TypeVariable*>>
+freeze_scheme_monotype(
+    const std::shared_ptr<Type>& mono,
+    const std::vector<TypeVariable*>& quantified_old
+) noexcept {
+    auto raw_resolve_tv = [](TypeVariable* tv) -> TypeVariable* {
+        if (!tv) return nullptr;
+        auto cur = tv;
+        while (cur->binding && cur->binding->kind == TypeKind::TypeVariable) {
+            auto next = static_cast<TypeVariable*>(cur->binding.get());
+            if (next->binding && next->binding->kind == TypeKind::TypeVariable) {
+                cur->binding = next->binding;
+            }
+            cur = next;
+        }
+        return cur;
+    };
+
+    auto is_recursive_bound_tv = [](TypeVariable* t) -> bool {
+        return is_recursive_mu_head(t);
+    };
+
+    std::vector<TypeVariable*> qold_repr_order;
+    qold_repr_order.reserve(quantified_old.size());
+    std::unordered_set<TypeVariable*> qold_repr_set;
+    qold_repr_set.reserve(quantified_old.size());
+    for (auto* qold : quantified_old) {
+        if (!qold) continue;
+        auto* repr = raw_resolve_tv(qold);
+        qold_repr_order.push_back(repr);
+        qold_repr_set.insert(repr);
+    }
+
+    {
+        std::unordered_set<const Type*> seen1;
+        std::function<void(const std::shared_ptr<Type>&)> collect_raw;
+        auto rec_tv_raw = [&](TypeVariable* tv) {
+            if (!tv) return;
+            if (!seen1.insert(tv).second) return;
+            bool is_q = qold_repr_set.count(tv);
+            bool is_rec = !is_q && is_recursive_bound_tv(tv);
+            if (tv->binding) collect_raw(tv->binding);
+        };
+        collect_raw = [&](const std::shared_ptr<Type>& t) {
+            if (!t) return;
+            auto r = t;
+            while (r && r->kind == TypeKind::TypeVariable) {
+                auto* rv = static_cast<TypeVariable*>(r.get());
+                rec_tv_raw(rv);
+                if (!rv->binding) return;
+                r = rv->binding;
+            }
+            if (!r) return;
+            if (r->kind == TypeKind::TypeVariable) return;
+            if (!seen1.insert(r.get()).second) return;
+            switch (r->kind) {
+            case TypeKind::Function: {
+                auto f = std::static_pointer_cast<FunctionType>(r);
+                for (const auto& p: f->params_ty) collect_raw(p);
+                collect_raw(f->ret_ty);
+                return;
+            }
+            case TypeKind::LambdaFunction: {
+                auto f = std::static_pointer_cast<LambdaFunctionType>(r);
+                for (const auto& p: f->params_ty) collect_raw(p);
+                collect_raw(f->ret_ty);
+                for (const auto& c: f->capture_tys) collect_raw(c);
+                return;
+            }
+            case TypeKind::NativeFunction: {
+                auto f = std::static_pointer_cast<NativeFunctionType>(r);
+                for (const auto& p: f->params_ty) collect_raw(p);
+                collect_raw(f->ret_ty);
+                return;
+            }
+            case TypeKind::Array: collect_raw(std::static_pointer_cast<ArrayType>(r)->type); return;
+            case TypeKind::Tuple: {
+                auto f = std::static_pointer_cast<TupleType>(r);
+                for (const auto& e: f->tys) collect_raw(e);
+                return;
+            }
+            case TypeKind::Nullable: collect_raw(std::static_pointer_cast<NullableType>(r)->value_type); return;
+            case TypeKind::Named: {
+                auto f = std::static_pointer_cast<NamedType>(r);
+                for (const auto& a: f->args) collect_raw(a);
+                return;
+            }
+            default: return;
+            }
+        };
+        collect_raw(mono);
+    }
+
+    std::unordered_map<TypeVariable*, std::shared_ptr<TypeVariable>> tv_map;
+    std::vector<std::pair<std::shared_ptr<TypeVariable>, std::shared_ptr<Type>>> delayed_bindings;
+
+    std::function<std::shared_ptr<Type>(const std::shared_ptr<Type>&)> copy;
+    copy = [&](const std::shared_ptr<Type>& t) -> std::shared_ptr<Type> {
+        if (!t) return t;
+        auto repr = resolve_hm(t);
+        if (repr->kind == TypeKind::TypeVariable) {
+            auto* key = std::static_pointer_cast<TypeVariable>(repr).get();
+            auto it = tv_map.find(key);
+            if (it != tv_map.end()) {
+                return std::static_pointer_cast<Type>(it->second);
+            }
+            bool is_q = (qold_repr_set.count(key) != 0);
+            bool is_rec = !is_q && is_recursive_bound_tv(key);
+            if (!is_q && !is_rec) {
+                return repr;
+            }
+            auto ntv = type_pool.fresh_type_variable();
+            tv_map.emplace(key, ntv);
+            bool self_is_mu = is_rec || (is_q && is_recursive_bound_tv(key));
+            if (self_is_mu) {
+                mark_mu_head(ntv->id);
+            }
+            if (is_rec && key->binding) {
+                delayed_bindings.emplace_back(ntv, key->binding);
+            }
+            return std::static_pointer_cast<Type>(ntv);
+        }
+        switch (repr->kind) {
+        case TypeKind::Function: {
+            auto f = std::static_pointer_cast<FunctionType>(repr);
+            std::vector<std::shared_ptr<Type>> ps;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(copy(p));
+            return type_pool.function(std::move(ps), copy(f->ret_ty));
+        }
+        case TypeKind::LambdaFunction: {
+            auto f = std::static_pointer_cast<LambdaFunctionType>(repr);
+            std::vector<std::shared_ptr<Type>> ps, cs;
+            ps.reserve(f->params_ty.size());
+            cs.reserve(f->capture_tys.size());
+            for (const auto& p : f->params_ty) ps.push_back(copy(p));
+            for (const auto& c : f->capture_tys) cs.push_back(copy(c));
+            return type_pool.lambda_function(std::move(ps), copy(f->ret_ty), std::move(cs));
+        }
+        case TypeKind::NativeFunction: {
+            auto f = std::static_pointer_cast<NativeFunctionType>(repr);
+            std::vector<std::shared_ptr<Type>> ps;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(copy(p));
+            return type_pool.native_function(std::move(ps), copy(f->ret_ty), f->name);
+        }
+        case TypeKind::Array:
+            return type_pool.array(copy(std::static_pointer_cast<ArrayType>(repr)->type));
+        case TypeKind::Tuple: {
+            auto tp = std::static_pointer_cast<TupleType>(repr);
+            std::vector<std::shared_ptr<Type>> vs;
+            vs.reserve(tp->tys.size());
+            for (const auto& e : tp->tys) vs.push_back(copy(e));
+            return type_pool.tuple(std::move(vs));
+        }
+        case TypeKind::Nullable:
+            return type_pool.nullable(copy(std::static_pointer_cast<NullableType>(repr)->value_type));
+        case TypeKind::Named: {
+            auto n = std::static_pointer_cast<NamedType>(repr);
+            std::vector<std::shared_ptr<Type>> as;
+            as.reserve(n->args.size());
+            for (const auto& a : n->args) as.push_back(copy(a));
+            return type_pool.named(n->name, std::move(as));
+        }
+        default:
+            return repr;
+        }
+    };
+    auto frozen_mono = copy(mono);
+    (void)delayed_bindings; // placeholder for compile warning; intentionally not filling.
+
+    std::vector<TypeVariable*> new_quantified;
+    new_quantified.reserve(qold_repr_order.size());
+    for (auto* repr_raw : qold_repr_order) {
+        auto it = tv_map.find(repr_raw);
+        if (it != tv_map.end()) {
+            new_quantified.push_back(it->second.get());
+        }
+    }
+    return { std::move(frozen_mono), std::move(new_quantified) };
+}
+
+static bool occurs_check_polar(
+    const TypeVariable* target_tv,
+    uint64_t target_id,
+    int polarity, 
+    const std::shared_ptr<Type>& in_type,
+    std::unordered_set<const Type*>& seen_ptr 
+) noexcept {
+    auto resolved = resolve_hm(in_type);
+    if (!resolved) return false;
+    if (resolved->kind == TypeKind::TypeVariable) {
+        auto* rv = static_cast<TypeVariable*>(resolved.get());
+        if (rv->id == target_id) {
+            return polarity != +1;
+        }
+        return false;
+    }
+    if (!seen_ptr.insert(resolved.get()).second) return false; // already visited
+    auto flip = [](int p) -> int { return (p == 0) ? 0 : -p; };
+    switch (resolved->kind) {
+    case TypeKind::Function: {
+        auto f = std::static_pointer_cast<FunctionType>(resolved);
+        int param_pol = flip(polarity);
+        for (const auto& p : f->params_ty) {
+            if (occurs_check_polar(target_tv, target_id, param_pol, p, seen_ptr)) return true;
+        }
+        return occurs_check_polar(target_tv, target_id, polarity, f->ret_ty, seen_ptr);
+    }
+    case TypeKind::LambdaFunction: {
+        auto f = std::static_pointer_cast<LambdaFunctionType>(resolved);
+        int param_pol = flip(polarity);
+        for (const auto& p : f->params_ty) {
+            if (occurs_check_polar(target_tv, target_id, param_pol, p, seen_ptr)) return true;
+        }
+        if (occurs_check_polar(target_tv, target_id, polarity, f->ret_ty, seen_ptr)) return true;
+        for (const auto& c : f->capture_tys) {
+            if (occurs_check_polar(target_tv, target_id, polarity, c, seen_ptr)) return true;
+        }
+        return false;
+    }
+    case TypeKind::NativeFunction: {
+        auto f = std::static_pointer_cast<NativeFunctionType>(resolved);
+        int param_pol = flip(polarity);
+        for (const auto& p : f->params_ty) {
+            if (occurs_check_polar(target_tv, target_id, param_pol, p, seen_ptr)) return true;
+        }
+        return occurs_check_polar(target_tv, target_id, polarity, f->ret_ty, seen_ptr);
+    }
+    case TypeKind::Array:
+        return occurs_check_polar(target_tv, target_id, polarity,
+                                  std::static_pointer_cast<ArrayType>(resolved)->type, seen_ptr);
+    case TypeKind::Tuple: {
+        auto t = std::static_pointer_cast<TupleType>(resolved);
+        for (const auto& e : t->tys) {
+            if (occurs_check_polar(target_tv, target_id, polarity, e, seen_ptr)) return true;
+        }
+        return false;
+    }
+    case TypeKind::Nullable:
+        return occurs_check_polar(target_tv, target_id, polarity,
+                                  std::static_pointer_cast<NullableType>(resolved)->value_type, seen_ptr);
+    case TypeKind::Named: {
+        auto n = std::static_pointer_cast<NamedType>(resolved);
+        for (const auto& a : n->args) {
+            if (occurs_check_polar(target_tv, target_id, polarity, a, seen_ptr)) return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+bool occurs_check(const std::shared_ptr<Type>& var, const std::shared_ptr<Type>& in_type) noexcept {
+    auto resolved_var = resolve_hm(var);
+    auto resolved = resolve_hm(in_type);
+    if (resolved_var.get() == resolved.get()) return true; 
+    if (!resolved) return false;
+    if (resolved_var->kind != TypeKind::TypeVariable) {
+        std::unordered_set<const Type*> seen;
+        std::function<bool(const std::shared_ptr<Type>&)> deep;
+        deep = [&](const std::shared_ptr<Type>& t) -> bool {
+            auto r = resolve_hm(t);
+            if (!r) return false;
+            if (r.get() == resolved_var.get()) return true;
+            if (r->kind == TypeKind::TypeVariable) return false;
+            if (!seen.insert(r.get()).second) return false;
+            switch (r->kind) {
+            case TypeKind::Function: {
+                auto f = std::static_pointer_cast<FunctionType>(r);
+                for (const auto& p : f->params_ty) if (deep(p)) return true;
+                return deep(f->ret_ty);
+            }
+            case TypeKind::LambdaFunction: {
+                auto f = std::static_pointer_cast<LambdaFunctionType>(r);
+                for (const auto& p : f->params_ty) if (deep(p)) return true;
+                if (deep(f->ret_ty)) return true;
+                for (const auto& c : f->capture_tys) if (deep(c)) return true;
+                return false;
+            }
+            case TypeKind::NativeFunction: {
+                auto f = std::static_pointer_cast<NativeFunctionType>(r);
+                for (const auto& p : f->params_ty) if (deep(p)) return true;
+                return deep(f->ret_ty);
+            }
+            case TypeKind::Array: return deep(std::static_pointer_cast<ArrayType>(r)->type);
+            case TypeKind::Tuple: {
+                auto t = std::static_pointer_cast<TupleType>(r);
+                for (const auto& e : t->tys) if (deep(e)) return true;
+                return false;
+            }
+            case TypeKind::Nullable: return deep(std::static_pointer_cast<NullableType>(r)->value_type);
+            case TypeKind::Named: {
+                auto n = std::static_pointer_cast<NamedType>(r);
+                for (const auto& a : n->args) if (deep(a)) return true;
+                return false;
+            }
+            default: return false;
+            }
+        };
+        return deep(resolved);
+    }
+    auto* target_tv = static_cast<TypeVariable*>(resolved_var.get());
+    uint64_t target_id = target_tv->id;
+    std::unordered_set<const Type*> seen_ptr;
+    return occurs_check_polar(target_tv, target_id, +1, resolved, seen_ptr);
+}
+
+struct UnifyTrailEntry {
+    TypeVariable* tv;
+    std::shared_ptr<Type> old_binding;
+};
+using UnifyTrailLevel = std::vector<UnifyTrailEntry>;
+inline std::vector<UnifyTrailLevel>& unify_trail_stack() noexcept {
+    static thread_local std::vector<UnifyTrailLevel> st;
+    return st;
+}
+inline void unify_trail_push() noexcept { unify_trail_stack().emplace_back(); }
+inline void unify_record_write(TypeVariable* tv) noexcept {
+    if (unify_trail_stack().empty()) return;
+    unify_trail_stack().back().push_back(UnifyTrailEntry{tv, tv->binding});
+}
+inline void unify_trail_rollback() noexcept {
+    auto& st = unify_trail_stack();
+    if (st.empty()) return;
+    auto level = std::move(st.back());
+    st.pop_back();
+    for (auto it = level.rbegin(); it != level.rend(); ++it) {
+        it->tv->binding = std::move(it->old_binding);
+    }
+}
+inline void unify_trail_commit() noexcept {
+    auto& st = unify_trail_stack();
+    if (st.size() <= 1) {
+        st.pop_back(); // top-level: discard, writes permanent
+        return;
+    }
+    auto current = std::move(st.back());
+    st.pop_back();
+    auto& parent = st.back();
+    parent.insert(parent.end(),
+                  std::make_move_iterator(current.begin()),
+                  std::make_move_iterator(current.end()));
+}
+
+bool unify_hm(const std::shared_ptr<Type>& lhs, const std::shared_ptr<Type>& rhs) noexcept {
+    if (!lhs || !rhs) { return false; }
+    auto a = resolve_hm(lhs);
+    auto b = resolve_hm(rhs);
+
+    if (a->kind == TypeKind::Unknown && b->kind == TypeKind::Unknown) {
+        return true;
+    }
+    if (a->kind == TypeKind::Unknown) {
+        return true;
+    }
+    if (b->kind == TypeKind::Unknown) {
+        return true;
+    }
+
+    if (a->kind == TypeKind::TypeVariable && b->kind == TypeKind::TypeVariable) {
+        if (a.get() == b.get()) return true;
+        auto ta = std::static_pointer_cast<TypeVariable>(a);
+        unify_record_write(ta.get());
+        ta->binding = b;
+        return true;
+    }
+    if (a->kind == TypeKind::TypeVariable) {
+        auto ta = std::static_pointer_cast<TypeVariable>(a);
+        if (occurs_check(a, b)) {
+             return false;
+         }
+        unify_record_write(ta.get());
+        ta->binding = b;
+        return true;
+    }
+    if (b->kind == TypeKind::TypeVariable) {
+        auto tb = std::static_pointer_cast<TypeVariable>(b);
+        // Debug1
+        if (occurs_check(b, a)) { return false; }
+        unify_record_write(tb.get());
+        tb->binding = a;
+        return true;
+    }
+    if (a->kind != b->kind) {
+        if ((a->kind == TypeKind::LambdaFunction && b->kind == TypeKind::Function) ||
+            (b->kind == TypeKind::LambdaFunction && a->kind == TypeKind::Function)) {
+            unify_trail_push();
+            std::shared_ptr<Type> fa_t = a, fb_t = b;
+            auto get_params = [](std::shared_ptr<Type> t) -> const std::vector<std::shared_ptr<Type>>& {
+                if (t->kind == TypeKind::Function)
+                    return std::static_pointer_cast<FunctionType>(t)->params_ty;
+                return std::static_pointer_cast<LambdaFunctionType>(t)->params_ty;
+            };
+            auto get_ret = [](std::shared_ptr<Type> t) -> const std::shared_ptr<Type>& {
+                if (t->kind == TypeKind::Function)
+                    return std::static_pointer_cast<FunctionType>(t)->ret_ty;
+                return std::static_pointer_cast<LambdaFunctionType>(t)->ret_ty;
+            };
+            const auto& pa = get_params(fa_t);
+            const auto& pb = get_params(fb_t);
+            if (pa.size() != pb.size()) { unify_trail_rollback(); return false; }
+            for (size_t i = 0; i < pa.size(); ++i) {
+                if (!unify_hm(pa[i], pb[i])) { unify_trail_rollback(); return false; }
+            }
+            if (!unify_hm(get_ret(fa_t), get_ret(fb_t))) { unify_trail_rollback(); return false; }
+            unify_trail_commit();
+            return true;
+        }
+
+        auto is_ground_leaf = [](TypeKind k) {
+            return k == TypeKind::Basic || k == TypeKind::String ||
+                   k == TypeKind::None  || k == TypeKind::Module ||
+                   k == TypeKind::AdtConstructor || k == TypeKind::Dimensioned;
+        };
+        auto ret_of = [](const std::shared_ptr<Type>& f_t,
+                         const std::shared_ptr<Type>** out_rt) -> bool {
+            if (f_t->kind == TypeKind::LambdaFunction) {
+                auto f = std::static_pointer_cast<LambdaFunctionType>(f_t);
+                if (f->params_ty.size() != 1) return false;
+                *out_rt = &f->ret_ty;
+                return true;
+            }
+            if (f_t->kind == TypeKind::Function) {
+                auto f = std::static_pointer_cast<FunctionType>(f_t);
+                if (f->params_ty.size() != 1) return false;
+                *out_rt = &f->ret_ty;
+                return true;
+            }
+            if (f_t->kind == TypeKind::NativeFunction) {
+                auto f = std::static_pointer_cast<NativeFunctionType>(f_t);
+                if (f->params_ty.size() != 1) return false;
+                *out_rt = &f->ret_ty;
+                return true;
+            }
+            return false;
+        };
+        auto try_etar_bidir = [&](const std::shared_ptr<Type>& A,
+                                  const std::shared_ptr<Type>& B) -> bool {
+          
+            auto is_1param_callable = [&](const std::shared_ptr<Type>& t, const std::shared_ptr<Type>** out_rt) -> bool {
+                auto cur = t;
+                while (cur && cur->kind == TypeKind::TypeVariable) {
+                    auto tv = std::static_pointer_cast<TypeVariable>(cur);
+                    if (!tv->binding) break;
+                    cur = tv->binding;
+                }
+                if (!cur) return false;
+                if (cur->kind == TypeKind::LambdaFunction) {
+                    auto f = std::static_pointer_cast<LambdaFunctionType>(cur);
+                    if (f->params_ty.size() != 1) return false;
+                    *out_rt = &f->ret_ty;
+                    return true;
+                }
+                if (cur->kind == TypeKind::Function) {
+                    auto f = std::static_pointer_cast<FunctionType>(cur);
+                    if (f->params_ty.size() != 1) return false;
+                    *out_rt = &f->ret_ty;
+                    return true;
+                }
+                if (cur->kind == TypeKind::NativeFunction) {
+                    auto f = std::static_pointer_cast<NativeFunctionType>(cur);
+                    if (f->params_ty.size() != 1) return false;
+                    *out_rt = &f->ret_ty;
+                    return true;
+                }
+                return false;
+            };
+            constexpr int MAX_ETA_DEPTH = 24;
+
+            std::vector<std::shared_ptr<Type>> a_nodes, b_nodes;
+            a_nodes.push_back(A);
+            b_nodes.push_back(B);
+            int da = 0, db = 0;
+            {
+                auto c = A;
+                const std::shared_ptr<Type>* rp;
+                while (da < MAX_ETA_DEPTH && is_1param_callable(c, &rp)) {
+                    c = *rp; ++da; a_nodes.push_back(c);
+                }
+            }
+            {
+                auto c = B;
+                const std::shared_ptr<Type>* rp;
+                while (db < MAX_ETA_DEPTH && is_1param_callable(c, &rp)) {
+                    c = *rp; ++db; b_nodes.push_back(c);
+                }
+            }
+            int min_d = std::min(da, db);
+            int diff  = std::abs(da - db);
+
+            auto with_perm_commit = [&](auto fn) -> bool {
+                auto& st = unify_trail_stack();
+                std::vector<UnifyTrailLevel> saved_levels;
+                saved_levels.reserve(st.size());
+                while (!st.empty()) { saved_levels.emplace_back(std::move(st.back())); st.pop_back(); }
+                bool ok = fn();
+                while (!saved_levels.empty()) { st.emplace_back(std::move(saved_levels.back())); saved_levels.pop_back(); }
+                return ok;
+            };
+            auto uwalk = [](std::shared_ptr<Type> c) -> std::shared_ptr<Type> {
+                while (c && c->kind == TypeKind::TypeVariable) {
+                    auto tv = std::static_pointer_cast<TypeVariable>(c);
+                    if (!tv->binding) break;
+                    c = tv->binding;
+                }
+                return c;
+            };
+
+            if (diff > 0) {
+                bool a_longer = (da > db);
+                auto short_mth = a_longer ? b_nodes[min_d] : a_nodes[min_d];  
+                auto long_pre  = a_longer ? a_nodes[min_d] : b_nodes[min_d];  
+                auto long_term = a_longer ? a_nodes.back()  : b_nodes.back();  
+                {
+                    auto lt = uwalk(long_term);
+                    if (lt && lt->kind == TypeKind::TypeVariable) {
+                        auto tv = std::static_pointer_cast<TypeVariable>(lt);
+                        if (min_d < 1) {
+                            return false;
+                        } else {
+                            return with_perm_commit([&]() {                                
+                                tv->binding = short_mth; return true;
+                            });
+                        }
+                    }
+                }
+
+                if (min_d >= 1) {
+                    return with_perm_commit([&]() {
+                        return unify_hm(short_mth, long_term);
+                    });
+                }
+            }
+            if (diff == 0) {
+                auto ta = uwalk(a_nodes.back());
+                auto tb = uwalk(b_nodes.back());
+                if (ta && ta->kind == TypeKind::TypeVariable) {
+                    auto tv = std::static_pointer_cast<TypeVariable>(ta);
+                    return with_perm_commit([&]() {
+                        tv->binding = b_nodes.back(); return true;
+                    });
+                }
+                if (tb && tb->kind == TypeKind::TypeVariable) {
+                    auto tv = std::static_pointer_cast<TypeVariable>(tb);
+                    return with_perm_commit([&]() {
+                        tv->binding = a_nodes.back(); return true;
+                    });
+                }
+                if (min_d >= 1) {
+                    return with_perm_commit([&]() {
+                        return unify_hm(a_nodes.back(), b_nodes.back());
+                    });
+                }
+            }
+
+            return false;
+        };
+       
+        bool a_leaf = is_ground_leaf(a->kind);
+        bool b_leaf = is_ground_leaf(b->kind);
+        if (a_leaf || b_leaf) {
+            if (try_etar_bidir(a, b)) return true;
+        }
+        return false;
+    }
+    switch (a->kind) {
+    case TypeKind::Basic:
+    case TypeKind::String:
+    case TypeKind::None:
+    case TypeKind::Module:
+    case TypeKind::AdtConstructor:
+    case TypeKind::Dimensioned:
+        if (!a->equals(b.get())) { return false; }
+        return true;
+    case TypeKind::Function: {
+        unify_trail_push();
+        auto fa = std::static_pointer_cast<FunctionType>(a);
+        auto fb = std::static_pointer_cast<FunctionType>(b);
+        if (fa->params_ty.size() != fb->params_ty.size()) { unify_trail_rollback(); return false; }
+        for (size_t i = 0; i < fa->params_ty.size(); ++i) {
+            if (!unify_hm(fa->params_ty[i], fb->params_ty[i])) { unify_trail_rollback(); return false; }
+        }
+        if (!unify_hm(fa->ret_ty, fb->ret_ty)) { unify_trail_rollback(); return false; }
+        unify_trail_commit();
+        return true;
+    }
+    case TypeKind::LambdaFunction: {
+        unify_trail_push();
+        auto fa = std::static_pointer_cast<LambdaFunctionType>(a);
+        auto fb = std::static_pointer_cast<LambdaFunctionType>(b);
+        if (fa->params_ty.size() != fb->params_ty.size()) {unify_trail_rollback(); return false; }
+        for (size_t i = 0; i < fa->params_ty.size(); ++i) {
+            if (!unify_hm(fa->params_ty[i], fb->params_ty[i])) { unify_trail_rollback(); return false; }
+        }
+        if (!unify_hm(fa->ret_ty, fb->ret_ty)) { unify_trail_rollback(); return false; }
+        unify_trail_commit();
+        return true;
+    }
+    case TypeKind::NativeFunction: {
+        unify_trail_push();
+        auto fa = std::static_pointer_cast<NativeFunctionType>(a);
+        auto fb = std::static_pointer_cast<NativeFunctionType>(b);
+        if (fa->name != fb->name) {unify_trail_rollback(); return false; }
+        if (fa->params_ty.size() != fb->params_ty.size()) {unify_trail_rollback(); return false; }
+        for (size_t i = 0; i < fa->params_ty.size(); ++i) {
+            if (!unify_hm(fa->params_ty[i], fb->params_ty[i])) { unify_trail_rollback(); return false; }
+        }
+        if (!unify_hm(fa->ret_ty, fb->ret_ty)) { unify_trail_rollback(); return false; }
+        unify_trail_commit();
+        return true;
+    }
+    case TypeKind::Array: {
+        auto aa = std::static_pointer_cast<ArrayType>(a);
+        auto ab = std::static_pointer_cast<ArrayType>(b);
+        return unify_hm(aa->type, ab->type);
+    }
+    case TypeKind::Tuple: {
+        unify_trail_push();
+        auto ta = std::static_pointer_cast<TupleType>(a);
+        auto tb = std::static_pointer_cast<TupleType>(b);
+        if (ta->tys.size() != tb->tys.size()) { unify_trail_rollback(); return false; }
+        for (size_t i = 0; i < ta->tys.size(); ++i) {
+            if (!unify_hm(ta->tys[i], tb->tys[i])) { unify_trail_rollback(); return false; }
+        }
+        unify_trail_commit();
+        return true;
+    }
+    case TypeKind::Nullable: {
+        auto na = std::static_pointer_cast<NullableType>(a);
+        auto nb = std::static_pointer_cast<NullableType>(b);
+        return unify_hm(na->value_type, nb->value_type);
+    }
+    case TypeKind::Named: {
+        unify_trail_push();
+        auto na = std::static_pointer_cast<NamedType>(a);
+        auto nb = std::static_pointer_cast<NamedType>(b);
+        if (na->name != nb->name) { unify_trail_rollback(); return false; }
+        if (na->args.size() != nb->args.size()) { unify_trail_rollback(); return false; }
+        for (size_t i = 0; i < na->args.size(); ++i) {
+            if (!unify_hm(na->args[i], nb->args[i])) { unify_trail_rollback(); return false; }
+        }
+        unify_trail_commit();
+        return true;
+    }
+    case TypeKind::Unknown:
+        return true;
+    default:
+        return a->equals(b.get());
+    }
+}
+
+std::shared_ptr<Type> deep_resolve(const std::shared_ptr<Type>& type) noexcept {
+    auto resolved = resolve_hm(type);
+    if (!resolved) return resolved;
+    switch (resolved->kind) {
+    case TypeKind::Function: {
+        auto f = std::static_pointer_cast<FunctionType>(resolved);
+        std::vector<std::shared_ptr<Type>> params;
+        params.reserve(f->params_ty.size());
+        for (const auto& p : f->params_ty) params.push_back(deep_resolve(p));
+        return type_pool.function(std::move(params), deep_resolve(f->ret_ty));
+    }
+    case TypeKind::LambdaFunction: {
+        auto f = std::static_pointer_cast<LambdaFunctionType>(resolved);
+        std::vector<std::shared_ptr<Type>> params, captures;
+        params.reserve(f->params_ty.size());
+        captures.reserve(f->capture_tys.size());
+        for (const auto& p : f->params_ty) params.push_back(deep_resolve(p));
+        for (const auto& c : f->capture_tys) captures.push_back(deep_resolve(c));
+        return type_pool.lambda_function(std::move(params), deep_resolve(f->ret_ty), std::move(captures));
+    }
+    case TypeKind::NativeFunction: {
+        auto f = std::static_pointer_cast<NativeFunctionType>(resolved);
+        std::vector<std::shared_ptr<Type>> params;
+        params.reserve(f->params_ty.size());
+        for (const auto& p : f->params_ty) params.push_back(deep_resolve(p));
+        return type_pool.native_function(std::move(params), deep_resolve(f->ret_ty), f->name);
+    }
+    case TypeKind::Array: {
+        auto a = std::static_pointer_cast<ArrayType>(resolved);
+        return type_pool.array(deep_resolve(a->type));
+    }
+    case TypeKind::Tuple: {
+        auto t = std::static_pointer_cast<TupleType>(resolved);
+        std::vector<std::shared_ptr<Type>> elements;
+        elements.reserve(t->tys.size());
+        for (const auto& e : t->tys) elements.push_back(deep_resolve(e));
+        return type_pool.tuple(std::move(elements));
+    }
+    case TypeKind::Nullable: {
+        auto n = std::static_pointer_cast<NullableType>(resolved);
+        return type_pool.nullable(deep_resolve(n->value_type));
+    }
+    case TypeKind::Named: {
+        auto n = std::static_pointer_cast<NamedType>(resolved);
+        std::vector<std::shared_ptr<Type>> args;
+        args.reserve(n->args.size());
+        for (const auto& a : n->args) args.push_back(deep_resolve(a));
+        return type_pool.named(n->name, std::move(args));
+    }
+    default:
+        return resolved;
+    }
+}
+
+std::shared_ptr<Type> replace_unknowns_with_tvars(const std::shared_ptr<Type>& type) noexcept {
+    if (!type) return type;
+    auto r = resolve_hm(type);
+    switch (r->kind) {
+    case TypeKind::Unknown:
+        return std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
+    case TypeKind::Nullable: {
+        auto n = std::static_pointer_cast<NullableType>(r);
+        return type_pool.nullable(replace_unknowns_with_tvars(n->value_type));
+    }
+    case TypeKind::Array: {
+        auto a = std::static_pointer_cast<ArrayType>(r);
+        return type_pool.array(replace_unknowns_with_tvars(a->type));
+    }
+    case TypeKind::Tuple: {
+        auto t = std::static_pointer_cast<TupleType>(r);
+        std::vector<std::shared_ptr<Type>> vs;
+        vs.reserve(t->tys.size());
+        for (const auto& e : t->tys) vs.push_back(replace_unknowns_with_tvars(e));
+        return type_pool.tuple(std::move(vs));
+    }
+    case TypeKind::Function: {
+        auto f = std::static_pointer_cast<FunctionType>(r);
+        std::vector<std::shared_ptr<Type>> ps;
+        ps.reserve(f->params_ty.size());
+        for (const auto& p : f->params_ty) ps.push_back(replace_unknowns_with_tvars(p));
+        return type_pool.function(std::move(ps), replace_unknowns_with_tvars(f->ret_ty));
+    }
+    case TypeKind::LambdaFunction: {
+        auto f = std::static_pointer_cast<LambdaFunctionType>(r);
+        std::vector<std::shared_ptr<Type>> ps, cs;
+        ps.reserve(f->params_ty.size());
+        cs.reserve(f->capture_tys.size());
+        for (const auto& p : f->params_ty) ps.push_back(replace_unknowns_with_tvars(p));
+        for (const auto& c : f->capture_tys) cs.push_back(replace_unknowns_with_tvars(c));
+        return type_pool.lambda_function(std::move(ps), replace_unknowns_with_tvars(f->ret_ty), std::move(cs));
+    }
+    case TypeKind::NativeFunction: {
+        auto f = std::static_pointer_cast<NativeFunctionType>(r);
+        std::vector<std::shared_ptr<Type>> ps;
+        ps.reserve(f->params_ty.size());
+        for (const auto& p : f->params_ty) ps.push_back(replace_unknowns_with_tvars(p));
+        return type_pool.native_function(std::move(ps), replace_unknowns_with_tvars(f->ret_ty), f->name);
+    }
+    case TypeKind::Named: {
+        auto n = std::static_pointer_cast<NamedType>(r);
+        std::vector<std::shared_ptr<Type>> as;
+        as.reserve(n->args.size());
+        for (const auto& a : n->args) as.push_back(replace_unknowns_with_tvars(a));
+        return type_pool.named(n->name, std::move(as));
+    }
+    default:
+        return r;
+    }
+}
+
+void collect_free_type_vars(
+    const std::shared_ptr<Type>& type,
+    std::unordered_set<TypeVariable*>& free_vars,
+    std::unordered_set<TypeVariable*>& visited
+) noexcept {
+    auto resolved = resolve_hm(type);
+    if (!resolved) return;
+    if (resolved->kind == TypeKind::TypeVariable) {
+        auto tv = std::static_pointer_cast<TypeVariable>(resolved).get();
+        if (!visited.insert(tv).second) return;
+        free_vars.insert(tv);
+        return;
+    }
+    auto recurse_list = [&](const std::vector<std::shared_ptr<Type>>& list) {
+        for (const auto& t : list) collect_free_type_vars(t, free_vars, visited);
+    };
+    switch (resolved->kind) {
+    case TypeKind::Function: {
+        auto f = std::static_pointer_cast<FunctionType>(resolved);
+        recurse_list(f->params_ty);
+        collect_free_type_vars(f->ret_ty, free_vars, visited);
+        break;
+    }
+    case TypeKind::LambdaFunction: {
+        auto f = std::static_pointer_cast<LambdaFunctionType>(resolved);
+        recurse_list(f->params_ty);
+        collect_free_type_vars(f->ret_ty, free_vars, visited);
+        recurse_list(f->capture_tys);
+        break;
+    }
+    case TypeKind::NativeFunction: {
+        auto f = std::static_pointer_cast<NativeFunctionType>(resolved);
+        recurse_list(f->params_ty);
+        collect_free_type_vars(f->ret_ty, free_vars, visited);
+        break;
+    }
+    case TypeKind::Array:
+        collect_free_type_vars(std::static_pointer_cast<ArrayType>(resolved)->type, free_vars, visited);
+        break;
+    case TypeKind::Tuple:
+        recurse_list(std::static_pointer_cast<TupleType>(resolved)->tys);
+        break;
+    case TypeKind::Nullable:
+        collect_free_type_vars(std::static_pointer_cast<NullableType>(resolved)->value_type, free_vars, visited);
+        break;
+    case TypeKind::Named:
+        recurse_list(std::static_pointer_cast<NamedType>(resolved)->args);
+        break;
+    default:
+        break;
+    }
+}
+
+std::shared_ptr<Type> instantiate_scheme(const TypeScheme& scheme) noexcept {
+    auto const_resolve = [](const std::shared_ptr<Type>& t) -> std::shared_ptr<Type> {
+        auto cur = t;
+        while (cur && cur->kind == TypeKind::TypeVariable) {
+            auto tv = std::static_pointer_cast<TypeVariable>(cur);
+            if (is_recursive_mu_head(tv.get())) break; 
+            if (!tv->binding) break;
+            cur = tv->binding;
+        }
+        return cur;
+    };
+
+    std::unordered_map<TypeVariable*, std::shared_ptr<TypeVariable>> fresh_tvs;
+    std::vector<std::pair<std::shared_ptr<TypeVariable>, std::shared_ptr<Type>>> delayed_fixup;
+    fresh_tvs.reserve(scheme.quantified.size());
+    delayed_fixup.reserve(scheme.quantified.size());
+    for (auto* q : scheme.quantified) {
+        auto fresh = type_pool.fresh_type_variable();
+        fresh_tvs.emplace(q, fresh);
+        if (q->binding) {
+            delayed_fixup.emplace_back(fresh, q->binding);
+        }
+    }
+    std::unordered_map<TypeVariable*, std::shared_ptr<Type>> subst;
+    subst.reserve(fresh_tvs.size());
+    for (auto& [k, v] : fresh_tvs) subst.emplace(k, std::static_pointer_cast<Type>(v));
+
+    std::function<std::shared_ptr<Type>(const std::shared_ptr<Type>&)> copy;
+    copy = [&](const std::shared_ptr<Type>& t) -> std::shared_ptr<Type> {
+        if (t && t->kind == TypeKind::TypeVariable) {
+            auto tv_raw = std::static_pointer_cast<TypeVariable>(t).get();
+            auto it = subst.find(tv_raw);
+            if (it != subst.end()) {
+                return it->second;
+            }
+        }
+        auto r = const_resolve(t);
+        if (!r) return r;
+        if (r->kind == TypeKind::TypeVariable) {
+            auto tv = std::static_pointer_cast<TypeVariable>(r).get();
+            auto it = subst.find(tv);
+            if (it != subst.end()) {
+                return it->second;
+            }
+            return r;
+        }
+        switch (r->kind) {
+        case TypeKind::Function: {
+            auto f = std::static_pointer_cast<FunctionType>(r);
+            std::vector<std::shared_ptr<Type>> params;
+            params.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) params.push_back(copy(p));
+            return type_pool.function(std::move(params), copy(f->ret_ty));
+        }
+        case TypeKind::LambdaFunction: {
+            auto f = std::static_pointer_cast<LambdaFunctionType>(r);
+            std::vector<std::shared_ptr<Type>> params, captures;
+            params.reserve(f->params_ty.size());
+            captures.reserve(f->capture_tys.size());
+            for (const auto& p : f->params_ty) params.push_back(copy(p));
+            for (const auto& c : f->capture_tys) captures.push_back(copy(c));
+            return type_pool.lambda_function(std::move(params), copy(f->ret_ty), std::move(captures));
+        }
+        case TypeKind::NativeFunction: {
+            auto f = std::static_pointer_cast<NativeFunctionType>(r);
+            std::vector<std::shared_ptr<Type>> params;
+            params.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) params.push_back(copy(p));
+            return type_pool.native_function(std::move(params), copy(f->ret_ty), f->name);
+        }
+        case TypeKind::Array:
+            return type_pool.array(copy(std::static_pointer_cast<ArrayType>(r)->type));
+        case TypeKind::Tuple: {
+            auto t = std::static_pointer_cast<TupleType>(r);
+            std::vector<std::shared_ptr<Type>> elements;
+            elements.reserve(t->tys.size());
+            for (const auto& e : t->tys) elements.push_back(copy(e));
+            return type_pool.tuple(std::move(elements));
+        }
+        case TypeKind::Nullable:
+            return type_pool.nullable(copy(std::static_pointer_cast<NullableType>(r)->value_type));
+        case TypeKind::Named: {
+            auto n = std::static_pointer_cast<NamedType>(r);
+            std::vector<std::shared_ptr<Type>> args;
+            args.reserve(n->args.size());
+            for (const auto& a : n->args) args.push_back(copy(a));
+            return type_pool.named(n->name, std::move(args));
+        }
+        default:
+            return r;
+        }
+    };
+    auto result = copy(scheme.monotype);
+    (void)delayed_fixup;
+    return result;
+}
+
+} // namespace lmx::hir
 
 namespace {
 
@@ -370,33 +1400,54 @@ bool bind_adt_type(const std::shared_ptr<Type>& expected,
 bool type_assignable(const std::shared_ptr<Type>& expected,
                      const std::shared_ptr<Type>& actual) noexcept {
     if (!expected || !actual) return false;
-    if (actual->kind == TypeKind::Never) return true;
-    if (expected->kind == TypeKind::Function && actual->kind == TypeKind::Function) {
-        const auto expected_function = std::static_pointer_cast<FunctionType>(expected);
-        const auto actual_function = std::static_pointer_cast<FunctionType>(actual);
-        if (expected_function->params_ty.size() != actual_function->params_ty.size()) return false;
-        for (size_t i = 0; i < expected_function->params_ty.size(); ++i) {
-            if (!expected_function->params_ty[i]->equals(actual_function->params_ty[i].get())) return false;
-        }
-        return actual_function->ret_ty->kind == TypeKind::Never ||
-               expected_function->ret_ty->equals(actual_function->ret_ty.get());
+    const auto expected_resolved = resolve_hm(expected);
+    const auto actual_resolved = resolve_hm(actual);
+    if (actual_resolved->kind == TypeKind::Never) return true;
+    if (expected_resolved->kind == TypeKind::TypeVariable ||
+        actual_resolved->kind == TypeKind::TypeVariable) {
+        return unify_hm(expected, actual);
     }
-    if (expected->kind == TypeKind::Nullable) {
-        const auto nullable = std::static_pointer_cast<NullableType>(expected);
-        if (actual->kind == TypeKind::Basic &&
-            std::static_pointer_cast<BasicType>(actual)->type == runtime::ValueKind::Null) return true;
-        if (actual->kind == TypeKind::Nullable)
+    if (numeric_rank(expected_resolved) >= 0 && numeric_rank(actual_resolved) >= 0) {
+        return numeric_rank(expected_resolved) >= numeric_rank(actual_resolved);
+    }
+    if (expected_resolved->kind == TypeKind::Nullable) {
+        const auto nullable = std::static_pointer_cast<NullableType>(expected_resolved);
+        if (actual_resolved->kind == TypeKind::Basic &&
+            std::static_pointer_cast<BasicType>(actual_resolved)->type == runtime::ValueKind::Null) return true;
+        if (actual_resolved->kind == TypeKind::Nullable)
             return type_assignable(nullable->value_type,
-                                   std::static_pointer_cast<NullableType>(actual)->value_type);
-        return type_assignable(nullable->value_type, actual);
+                                   std::static_pointer_cast<NullableType>(actual_resolved)->value_type);
+        return type_assignable(nullable->value_type, actual_resolved);
     }
-    if (expected->kind != TypeKind::Named || actual->kind != TypeKind::Named)
-        return expected->equals(actual.get());
-    const auto expected_named = std::static_pointer_cast<NamedType>(expected);
-    const auto actual_named = std::static_pointer_cast<NamedType>(actual);
+    if ((expected_resolved->kind == TypeKind::Function || expected_resolved->kind == TypeKind::LambdaFunction) &&
+        (actual_resolved->kind == TypeKind::Function || actual_resolved->kind == TypeKind::LambdaFunction)) {
+        if (expected_resolved->kind == TypeKind::Function && actual_resolved->kind == TypeKind::Function) {
+            const auto expected_function = std::static_pointer_cast<FunctionType>(expected_resolved);
+            const auto actual_function = std::static_pointer_cast<FunctionType>(actual_resolved);
+            if (expected_function->params_ty.size() == actual_function->params_ty.size()) {
+                bool params_ok = true;
+                for (size_t i = 0; i < expected_function->params_ty.size(); ++i) {
+                    if (!expected_function->params_ty[i]->equals(actual_function->params_ty[i].get())) {
+                        params_ok = false;
+                        break;
+                    }
+                }
+                if (params_ok) {
+                    return actual_function->ret_ty->kind == TypeKind::Never ||
+                           expected_function->ret_ty->equals(actual_function->ret_ty.get());
+                }
+            }
+        }
+        return unify_hm(expected_resolved, actual_resolved);
+    }
+    if (expected_resolved->kind != TypeKind::Named || actual_resolved->kind != TypeKind::Named)
+        return expected_resolved->equals(actual_resolved.get());
+    const auto expected_named = std::static_pointer_cast<NamedType>(expected_resolved);
+    const auto actual_named = std::static_pointer_cast<NamedType>(actual_resolved);
     if (expected_named->name != actual_named->name || expected_named->args.size() != actual_named->args.size()) return false;
     for (size_t i = 0; i < expected_named->args.size(); ++i) {
         if (actual_named->args[i]->kind == TypeKind::Unknown) continue;
+        if (resolve_hm(actual_named->args[i])->kind == TypeKind::TypeVariable) continue;
         if (!type_assignable(expected_named->args[i], actual_named->args[i])) return false;
     }
     return true;
@@ -415,17 +1466,25 @@ bool interval_member_assignable(const std::shared_ptr<Type>& expected,
 std::shared_ptr<Type> unify_types(const std::shared_ptr<Type>& lhs,
                                   const std::shared_ptr<Type>& rhs) noexcept {
     if (!lhs || !rhs) return nullptr;
+    auto l_resolved = resolve_hm(lhs);
+    auto r_resolved = resolve_hm(rhs);
     if (lhs->kind == TypeKind::Never)
         return rhs->kind == TypeKind::Never ? lhs : rhs;
     if (rhs->kind == TypeKind::Never) return lhs;
-    if (lhs->kind == TypeKind::Unknown) return rhs;
-    if (rhs->kind == TypeKind::Unknown) return lhs;
+    if (l_resolved->kind == TypeKind::Unknown) return rhs;
+    if (r_resolved->kind == TypeKind::Unknown) return lhs;
+    if (l_resolved->kind == TypeKind::TypeVariable || r_resolved->kind == TypeKind::TypeVariable) {
+        if (unify_hm(lhs, rhs)) return deep_resolve(lhs);
+        return nullptr;
+    }
     if (numeric_rank(lhs) >= 0 && numeric_rank(rhs) >= 0)
         return unify_interval_bounds(lhs, rhs);
     const auto is_null = [](const std::shared_ptr<Type>& type) {
+        if (!type)
+            return false;
         return type->kind == TypeKind::Basic &&
                std::static_pointer_cast<BasicType>(type)->type == runtime::ValueKind::Null;
-    };
+    };  
     if (lhs->kind == TypeKind::Nullable) {
         const auto nullable = std::static_pointer_cast<NullableType>(lhs);
         if (is_null(rhs)) return lhs;
@@ -435,8 +1494,10 @@ std::shared_ptr<Type> unify_types(const std::shared_ptr<Type>& lhs,
         return unified ? type_pool.nullable(std::move(unified)) : nullptr;
     }
     if (rhs->kind == TypeKind::Nullable || is_null(lhs)) return unify_types(rhs, lhs);
-    if (lhs->kind != TypeKind::Named || rhs->kind != TypeKind::Named)
+    if (lhs->kind != TypeKind::Named || rhs->kind != TypeKind::Named) {
+        if (unify_hm(lhs, rhs)) return deep_resolve(lhs);
         return lhs->equals(rhs.get()) ? lhs : nullptr;
+    }
     const auto left = std::static_pointer_cast<NamedType>(lhs);
     const auto right = std::static_pointer_cast<NamedType>(rhs);
     if (left->name != right->name || left->args.size() != right->args.size()) return nullptr;
@@ -451,17 +1512,72 @@ std::shared_ptr<Type> unify_types(const std::shared_ptr<Type>& lhs,
 }
 
 bool contains_unknown_type(const std::shared_ptr<Type>& type) noexcept {
-    if (!type) return false;
-    if (type->kind == TypeKind::Unknown) return true;
-    if (type->kind == TypeKind::Nullable)
-        return contains_unknown_type(std::static_pointer_cast<NullableType>(type)->value_type);
-    if (type->kind == TypeKind::Tuple) {
-        const auto tuple = std::static_pointer_cast<TupleType>(type);
+    auto resolved = resolve_hm(type);
+    if (!resolved) return false;
+    if (resolved->kind == TypeKind::Unknown) return true;
+    if (resolved->kind == TypeKind::Nullable)
+        return contains_unknown_type(std::static_pointer_cast<NullableType>(resolved)->value_type);
+    if (resolved->kind == TypeKind::Tuple) {
+        const auto tuple = std::static_pointer_cast<TupleType>(resolved);
         return std::any_of(tuple->tys.begin(), tuple->tys.end(), contains_unknown_type);
     }
-    if (type->kind != TypeKind::Named) return false;
-    const auto named = std::static_pointer_cast<NamedType>(type);
+    if (resolved->kind == TypeKind::Function) {
+        const auto f = std::static_pointer_cast<FunctionType>(resolved);
+        for (const auto& p : f->params_ty) if (contains_unknown_type(p)) return true;
+        return contains_unknown_type(f->ret_ty);
+    }
+    if (resolved->kind == TypeKind::LambdaFunction) {
+        const auto f = std::static_pointer_cast<LambdaFunctionType>(resolved);
+        for (const auto& p : f->params_ty) if (contains_unknown_type(p)) return true;
+        if (contains_unknown_type(f->ret_ty)) return true;
+        for (const auto& c : f->capture_tys) if (contains_unknown_type(c)) return true;
+        return false;
+    }
+    if (resolved->kind == TypeKind::Array)
+        return contains_unknown_type(std::static_pointer_cast<ArrayType>(resolved)->type);
+    if (resolved->kind != TypeKind::Named) return false;
+    const auto named = std::static_pointer_cast<NamedType>(resolved);
     return std::any_of(named->args.begin(), named->args.end(), contains_unknown_type);
+}
+
+bool contains_adt_unknown_args(const std::shared_ptr<Type>& type) noexcept {
+    auto resolved = resolve_hm(type);
+    if (!resolved) return false;
+    auto recurse = [&](const std::vector<std::shared_ptr<Type>>& list) {
+        for (const auto& t : list) if (contains_adt_unknown_args(t)) return true;
+        return false;
+    };
+    switch (resolved->kind) {
+    case TypeKind::Nullable:
+        return contains_adt_unknown_args(std::static_pointer_cast<NullableType>(resolved)->value_type);
+    case TypeKind::Tuple:
+        return recurse(std::static_pointer_cast<TupleType>(resolved)->tys);
+    case TypeKind::Array:
+        return contains_adt_unknown_args(std::static_pointer_cast<ArrayType>(resolved)->type);
+    case TypeKind::Function: {
+        auto f = std::static_pointer_cast<FunctionType>(resolved);
+        return recurse(f->params_ty) || contains_adt_unknown_args(f->ret_ty);
+    }
+    case TypeKind::LambdaFunction: {
+        auto f = std::static_pointer_cast<LambdaFunctionType>(resolved);
+        return recurse(f->params_ty) || contains_adt_unknown_args(f->ret_ty) || recurse(f->capture_tys);
+    }
+    case TypeKind::NativeFunction: {
+        auto f = std::static_pointer_cast<NativeFunctionType>(resolved);
+        return recurse(f->params_ty) || contains_adt_unknown_args(f->ret_ty);
+    }
+    case TypeKind::Named: {
+        auto n = std::static_pointer_cast<NamedType>(resolved);
+        for (const auto& a : n->args) {
+            auto ra = resolve_hm(a);
+            if (ra && ra->kind == TypeKind::Unknown) return true;
+            if (contains_adt_unknown_args(a)) return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
 }
 
 std::shared_ptr<Type> instantiate_adt_type(const std::shared_ptr<Type>& type,
@@ -695,9 +1811,16 @@ std::shared_ptr<Type> TypeCkContext::inference_type(ExprNode* type) noexcept {
             return type_pool.basic(runtime::ValueKind::Expr);
         }
         if (node->type && node->type->kind != TypeKind::Unknown) return node->type;
-        if (find_var(node->id).has_value())return (*find_var(node->id))->type;
-        if (find_global(node->id).has_value())
-            return (*find_global(node->id))->type;
+        if (find_var(node->id).has_value()) {
+            auto var = *find_var(node->id);
+            if (var->scheme.has_value()) return instantiate_scheme(*var->scheme);
+            return var->type;
+        }
+        if (find_global(node->id).has_value()) {
+            auto var = *find_global(node->id);
+            if (var->scheme.has_value()) return instantiate_scheme(*var->scheme);
+            return var->type;
+        }
         break;
     }
     case ASTKind::Unary: {
@@ -768,9 +1891,29 @@ std::shared_ptr<Type> TypeCkContext::inference_type(ExprNode* type) noexcept {
     }
     case ASTKind::SuffixParen: {
         const auto node = reinterpret_cast<SuffixParenNode*>(type);
-        const auto left_ty = std::reinterpret_pointer_cast<FunctionType>(inference_type(node->expr.get()));
-        return left_ty->ret_ty;
-        break;
+        const auto callee_ty_orig = node->expr && !Type::is_null_type(node->expr->type.get())
+            ? node->expr->type
+            : inference_type(node->expr.get());
+        if (callee_ty_orig) {
+            const auto callee_ty = resolve_hm(callee_ty_orig);
+            if (callee_ty->kind == TypeKind::Function)
+                return std::reinterpret_pointer_cast<FunctionType>(callee_ty)->ret_ty;
+            if (callee_ty->kind == TypeKind::LambdaFunction)
+                return std::reinterpret_pointer_cast<LambdaFunctionType>(callee_ty)->ret_ty;
+            if (callee_ty->kind == TypeKind::NativeFunction)
+                return std::reinterpret_pointer_cast<NativeFunctionType>(callee_ty)->ret_ty;
+            if (callee_ty->kind == TypeKind::TypeVariable) {
+                auto ret = type_pool.fresh_type_variable();
+                std::vector<std::shared_ptr<Type>> params;
+                const size_t n = node->suffix ? node->suffix->exprs.size() : 0;
+                for (size_t i = 0; i < n; ++i)
+                    params.push_back(std::static_pointer_cast<Type>(type_pool.fresh_type_variable()));
+                auto lf = type_pool.lambda_function(std::move(params), std::static_pointer_cast<Type>(ret), {});
+                unify_hm(callee_ty, lf);
+                return std::static_pointer_cast<Type>(ret);
+            }
+        }
+        return type_pool.unknown();
     }
     case ASTKind::SuffixBracket: {
         const auto node = reinterpret_cast<SuffixBracketNode*>(type);
@@ -835,11 +1978,336 @@ std::shared_ptr<Type> TypeCkContext::inference_type(ExprNode* type) noexcept {
     case ASTKind::TupleGetExpr: {
         break;
     }
+    case ASTKind::LambdaExpr: {
+        const auto node = reinterpret_cast<LambdaExprNode*>(type);
+        if (node->type && !Type::is_null_type(node->type.get()) && node->type->kind != TypeKind::Unknown) {
+            return node->type;
+        }
+        return inference_type(node->body.get());
+    }
     default: std::unreachable();
     }
     return type_pool.unknown();
 }
 
+static bool has_explicit_return(ExprNode *expr) noexcept {
+    if (!expr) return false;
+    if (expr->kind == ASTKind::Return) return true;
+    if (expr->kind == ASTKind::Block) {
+        auto *blk = static_cast<BlockExprNode*>(expr);
+        for (const auto& s : blk->stmts) {
+            if (!s) continue;
+            if (s->kind == ASTKind::Return) return true;
+            if (s->kind == ASTKind::ExprStmt) {
+                auto *es = static_cast<ExprStmtNode*>(s.get());
+                if (es->expr && has_explicit_return(es->expr.get())) return true;
+            }
+            if (s->kind == ASTKind::IfExpr) {
+                auto *ie = reinterpret_cast<IfExprNode*>(s.get());
+                if (has_explicit_return(static_cast<ExprNode*>(ie))) return true;
+            }
+        }
+    }
+    if (expr->kind == ASTKind::IfExpr) {
+        auto *ie = static_cast<IfExprNode*>(expr);
+        if (has_explicit_return(ie->then.get())) return true;
+        if (ie->els && has_explicit_return(ie->els.get())) return true;
+    }
+    return false;
+}
+
+
+static void collect_referenced_identifiers(
+    ExprNode *expr,
+    std::unordered_set<std::string> &names
+) noexcept {
+    if (!expr) return;
+    switch (expr->kind) {
+    case ASTKind::Identifier: {
+        const auto *id = static_cast<IdentifierNode*>(expr);
+        names.insert(id->id);
+        break;
+    }
+    case ASTKind::Binary: {
+        const auto *b = static_cast<BinaryNode*>(expr);
+        collect_referenced_identifiers(b->lhs.get(), names);
+        collect_referenced_identifiers(b->rhs.get(), names);
+        break;
+    }
+    case ASTKind::Unary: {
+        const auto *u = static_cast<UnaryNode*>(expr);
+        collect_referenced_identifiers(u->expr.get(), names);
+        break;
+    }
+    case ASTKind::PipeExpr: {
+        const auto *p = static_cast<PipeExprNode*>(expr);
+        collect_referenced_identifiers(p->lhs.get(), names);
+        collect_referenced_identifiers(p->rhs.get(), names);
+        break;
+    }
+    case ASTKind::LambdaExpr: {
+        const auto *l = static_cast<LambdaExprNode*>(expr);
+        std::unordered_set<std::string> inner_params;
+        if (l->params) {
+            for (const auto& [pname, _] : l->params->stmts) {
+                inner_params.insert(pname);
+            }
+        }
+        std::unordered_set<std::string> inner_names;
+        collect_referenced_identifiers(l->body.get(), inner_names);
+        for (const auto& n : inner_names) {
+            if (inner_params.count(n) == 0) {
+                names.insert(n);
+            }
+        }
+        break;
+    }
+    case ASTKind::IfExpr: {
+        const auto *i = static_cast<IfExprNode*>(expr);
+        collect_referenced_identifiers(i->cond.get(), names);
+        collect_referenced_identifiers(i->then.get(), names);
+        if (i->els) collect_referenced_identifiers(i->els.get(), names);
+        break;
+    }
+    case ASTKind::Block: {
+        const auto *blk = static_cast<BlockExprNode*>(expr);
+        for (const auto& s : blk->stmts) {
+            if (!s) continue;
+            if (s->kind == ASTKind::Return) {
+                const auto *ret = static_cast<ReturnNode*>(s.get());
+                collect_referenced_identifiers(ret->expr.get(), names);
+            } else if (s->kind == ASTKind::TailReturn) {
+                const auto *ret = static_cast<TailReturnNode*>(s.get());
+                collect_referenced_identifiers(ret->expr.get(), names);
+            } else if (s->kind == ASTKind::ExprStmt) {
+                const auto *es = static_cast<ExprStmtNode*>(s.get());
+                collect_referenced_identifiers(es->expr.get(), names);
+            } else if (s->kind == ASTKind::VarDecl) {
+                // var 声明中的变量名是局部的，不捕获；但初始化达式中的引用需要收集
+                const auto *vd = static_cast<VarDeclNode*>(s.get());
+                collect_referenced_identifiers(vd->init_value.get(), names);
+            } else if (s->kind == ASTKind::AssignStmt) {
+                const auto *as = static_cast<AssignStmtNode*>(s.get());
+                collect_referenced_identifiers(as->lhs.get(), names);
+                collect_referenced_identifiers(as->rhs.get(), names);
+            } else if (s->kind == ASTKind::LoopStmt) {
+                const auto *lp = static_cast<LoopStmtNode*>(s.get());
+                collect_referenced_identifiers(lp->expr.get(), names);
+                for (const auto& bs : lp->body) {
+                    if (bs && bs->kind == ASTKind::ExprStmt) {
+                        collect_referenced_identifiers(
+                            static_cast<ExprStmtNode*>(bs.get())->expr.get(), names);
+                    }
+                }
+            } else if (s->kind == ASTKind::IfExpr) {
+                collect_referenced_identifiers(reinterpret_cast<ExprNode*>(s.get()), names);
+            }
+        }
+        break;
+    }
+    case ASTKind::SuffixParen: {
+        const auto *sp = static_cast<SuffixParenNode*>(expr);
+        collect_referenced_identifiers(sp->expr.get(), names);
+        if (sp->suffix) {
+            for (const auto& a : sp->suffix->exprs) {
+                collect_referenced_identifiers(a.get(), names);
+            }
+        }
+        break;
+    }
+    case ASTKind::SuffixBracket: {
+        const auto *sb = static_cast<SuffixBracketNode*>(expr);
+        collect_referenced_identifiers(sb->expr.get(), names);
+        collect_referenced_identifiers(sb->suffix.get(), names);
+        break;
+    }
+    case ASTKind::AsExpr: {
+        const auto *ae = static_cast<AsExprNode*>(expr);
+        collect_referenced_identifiers(ae->expr.get(), names);
+        break;
+    }
+    case ASTKind::DotExpr: {
+        // DotExpr 的 rhs 是字段名而非变量，只收集 lhs
+        const auto *de = static_cast<DotExprNode*>(expr);
+        collect_referenced_identifiers(de->expr.get(), names);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void collect_param_constraints(
+    ExprNode *expr,
+    const std::unordered_set<std::string> &param_names,
+    std::unordered_map<std::string, std::vector<std::shared_ptr<Type>>> &candidates
+) noexcept {
+    if (!expr) return;
+    switch (expr->kind) {
+    case ASTKind::Binary: {
+        auto *b = static_cast<BinaryNode*>(expr);
+        collect_param_constraints(b->lhs.get(), param_names, candidates);
+        collect_param_constraints(b->rhs.get(), param_names, candidates);
+        auto add_constraint_from_other = [&](ExprNode *which, ExprNode *other) {
+            if (which->kind == ASTKind::Identifier) {
+                const auto *id = static_cast<IdentifierNode*>(which);
+                if (param_names.count(id->id) > 0 && other->type &&
+                    other->type->kind != TypeKind::Unknown &&
+                    other->type->kind != TypeKind::None) {
+                    candidates[id->id].push_back(other->type);
+                }
+            }
+        };
+        add_constraint_from_other(b->lhs.get(), b->rhs.get());
+        add_constraint_from_other(b->rhs.get(), b->lhs.get());
+        break;
+    }
+    case ASTKind::Unary: {
+        auto *u = static_cast<UnaryNode*>(expr);
+        collect_param_constraints(u->expr.get(), param_names, candidates);
+        break;
+    }
+    case ASTKind::PipeExpr: {
+        auto *p = static_cast<PipeExprNode*>(expr);
+        if (!p->lhs || !p->rhs) break;
+        collect_param_constraints(p->lhs.get(), param_names, candidates);
+        collect_param_constraints(p->rhs.get(), param_names, candidates);
+        if (p->rhs->kind == ASTKind::LambdaExpr && p->lhs->type &&
+            p->lhs->type->kind != TypeKind::Unknown &&
+            p->lhs->type->kind != TypeKind::None) {
+            auto *lambda = static_cast<LambdaExprNode*>(p->rhs.get());
+            if (lambda->params && !lambda->params->stmts.empty()) {
+                const auto &first = lambda->params->stmts.front();
+                candidates[first.first].push_back(p->lhs->type);
+            }
+        }
+        break;
+    }
+    case ASTKind::LambdaExpr: {
+        auto *l = static_cast<LambdaExprNode*>(expr);
+        collect_param_constraints(l->body.get(), param_names, candidates);
+        break;
+    }
+    case ASTKind::IfExpr: {
+        auto *i = static_cast<IfExprNode*>(expr);
+        collect_param_constraints(i->cond.get(), param_names, candidates);
+        collect_param_constraints(i->then.get(), param_names, candidates);
+        if (i->els) collect_param_constraints(i->els.get(), param_names, candidates);
+        break;
+    }
+    case ASTKind::Block: {
+        auto *blk = static_cast<BlockExprNode*>(expr);
+        for (auto &s : blk->stmts) {
+            if (!s) continue;
+            if (s->kind == ASTKind::Return) {
+                auto *ret = static_cast<ReturnNode*>(s.get());
+                collect_param_constraints(ret->expr.get(), param_names, candidates);
+            } else if (s->kind == ASTKind::TailReturn) {
+                auto *ret = static_cast<TailReturnNode*>(s.get());
+                collect_param_constraints(ret->expr.get(), param_names, candidates);
+            } else if (s->kind == ASTKind::ExprStmt) {
+                auto *es = static_cast<ExprStmtNode*>(s.get());
+                collect_param_constraints(es->expr.get(), param_names, candidates);
+            } else if (s->kind == ASTKind::VarDecl) {
+                auto *vd = static_cast<VarDeclNode*>(s.get());
+                collect_param_constraints(vd->init_value.get(), param_names, candidates);
+            } else if (s->kind == ASTKind::AssignStmt) {
+                auto *as = static_cast<AssignStmtNode*>(s.get());
+                collect_param_constraints(as->lhs.get(), param_names, candidates);
+                collect_param_constraints(as->rhs.get(), param_names, candidates);
+                if (as->lhs->kind == ASTKind::Identifier) {
+                    const auto *lid = static_cast<IdentifierNode*>(as->lhs.get());
+                    if (param_names.count(lid->id) > 0 && as->rhs->type &&
+                        as->rhs->type->kind != TypeKind::Unknown &&
+                        as->rhs->type->kind != TypeKind::None) {
+                        candidates[lid->id].push_back(as->rhs->type);
+                    }
+                }
+            } else if (s->kind == ASTKind::LoopStmt) {
+                auto *lp = static_cast<LoopStmtNode*>(s.get());
+                collect_param_constraints(lp->expr.get(), param_names, candidates);
+                for (auto &bs : lp->body) {
+                    if (bs->kind == ASTKind::ExprStmt) {
+                        collect_param_constraints(static_cast<ExprStmtNode*>(bs.get())->expr.get(),
+                                                  param_names, candidates);
+                    }
+                }
+            } else if (s->kind == ASTKind::IfExpr) {
+                auto *if_stmt_s = reinterpret_cast<IfExprNode*>(s.get());
+                collect_param_constraints(static_cast<ExprNode*>(if_stmt_s), param_names, candidates);
+            }
+        }
+        break;
+    }
+    case ASTKind::SuffixParen: {
+        auto *sp = static_cast<SuffixParenNode*>(expr);
+        collect_param_constraints(sp->expr.get(), param_names, candidates);
+        if (sp->suffix) {
+            for (auto &a : sp->suffix->exprs) collect_param_constraints(a.get(), param_names, candidates);
+        }
+        const auto callee_ty = sp->expr && !Type::is_null_type(sp->expr->type.get())
+            ? sp->expr->type : nullptr;
+        const std::vector<std::shared_ptr<Type>> *formal_params = nullptr;
+        if (callee_ty && callee_ty->kind == TypeKind::Function)
+            formal_params = &static_cast<FunctionType*>(callee_ty.get())->params_ty;
+        else if (callee_ty && callee_ty->kind == TypeKind::LambdaFunction)
+            formal_params = &static_cast<LambdaFunctionType*>(callee_ty.get())->params_ty;
+        if (formal_params && sp->suffix) {
+            const size_t N = std::min(formal_params->size(), sp->suffix->exprs.size());
+            for (size_t i = 0; i < N; i++) {
+                auto &arg = sp->suffix->exprs[i];
+                auto &ft = (*formal_params)[i];
+                if (!ft || ft->kind == TypeKind::Unknown || ft->kind == TypeKind::None) continue;
+                if (arg->kind == ASTKind::Identifier) {
+                    const auto *aid = static_cast<IdentifierNode*>(arg.get());
+                    if (param_names.count(aid->id) > 0) candidates[aid->id].push_back(ft);
+                }
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void narrow_lambda_param_types(LambdaExprNode *lambda, size_t line, size_t col) noexcept {
+    std::unordered_set<std::string> param_names;
+    for (auto &[name, _] : lambda->params->stmts) param_names.insert(name);
+
+    std::unordered_map<std::string, std::vector<std::shared_ptr<Type>>> candidates;
+    for (auto &[name, _] : lambda->params->stmts) candidates[name] = {};
+
+    collect_param_constraints(lambda->body.get(), param_names, candidates);
+
+    for (auto &[pname, pty] : lambda->params->stmts) {
+        auto it = candidates.find(pname);
+        if (it == candidates.end()) continue;
+        auto &cands = it->second;
+        std::vector<std::shared_ptr<Type>> uniq;
+        for (auto &c : cands) {
+            bool dup = false;
+            for (auto &u : uniq) if (u->equals(c.get())) { dup = true; break; }
+            if (!dup) uniq.push_back(c);
+        }
+        if (uniq.empty()) continue;
+      
+        auto inferred = uniq.front();
+        if (Type::is_null_type(pty.get()) || pty->kind == TypeKind::Unknown) {
+            pty = inferred;
+        } else if (!pty->equals(inferred.get())) {
+            throw_error(ErrorType::Analysis,
+                "lambda param `" + pname + "` declared type (" + Type::to_string(pty.get()) +
+                ") mismatches inferred type (" + Type::to_string(inferred.get()) + ")",
+                line, col);
+            return;
+        }
+    }
+}
+
+static std::shared_ptr<ExprNode> make_lambda_dummy_return(size_t line, size_t col) noexcept {
+    return std::make_shared<LiteralNode>(line, col, "0", LiteralNode::Kind::Integer);
+}
 
 static std::shared_ptr<StmtNode> sugar_loop_count(const std::shared_ptr<LoopStmtNode>& stmt) noexcept {
     std::string name = "@loop_cnt_id";
@@ -865,9 +2333,6 @@ static std::shared_ptr<StmtNode> sugar_loop_count(const std::shared_ptr<LoopStmt
         stmt->line, stmt->col, std::make_shared<BlockExprNode>(stmt->line, stmt->col, std::move(block)));
     return result;
 }
-
-
-
 
 std::vector<Scope::Var> TypeCkContext::check_module(const std::shared_ptr<Module> &mod) noexcept {
     const auto save_cur_module = cur_module;
@@ -1110,15 +2575,291 @@ std::vector<Scope::Var> TypeCkContext::check_module(const std::shared_ptr<Module
     // Module exports include imported modules so packages can expose
     // hierarchical APIs such as std.cas and std.math.
     for (const auto& v : get_global()) {
+        const auto ty = resolve_hm(v.type);
+        if (!ty) continue;
         if (v.is_export &&
-            (v.type->kind == TypeKind::Function ||
-             v.type->kind == TypeKind::NativeFunction ||
-             v.type->kind == TypeKind::Module)) {
+            (ty->kind == TypeKind::Function ||
+             ty->kind == TypeKind::NativeFunction ||
+             ty->kind == TypeKind::Module)) {
             result.push_back(v);
         }
     }
     return result;
 }
+
+static void
+curry_freshen_intersection_tvs(
+    TypePool& type_pool,
+    std::vector<std::shared_ptr<Type>>& remaining_params,
+    std::vector<std::shared_ptr<Type>>& remaining_captures,
+    std::shared_ptr<Type>& ret_ty
+) noexcept {
+    std::function<void(const std::shared_ptr<Type>&, std::unordered_set<TypeVariable*>&)>
+        collect_bare;
+    collect_bare = [&](const std::shared_ptr<Type>& t, std::unordered_set<TypeVariable*>& out) {
+        if (!t) return;
+        auto r = t;
+        while (r && r->kind == TypeKind::TypeVariable) {
+            auto* tv = static_cast<TypeVariable*>(r.get());
+            if (is_recursive_mu_head(tv)) { out.insert(tv); return; } 
+            if (!tv->binding) { out.insert(tv); return; }
+            r = tv->binding;
+        }
+        switch (r->kind) {
+        case TypeKind::Function: {
+            auto f = std::static_pointer_cast<FunctionType>(r);
+            for (const auto& p : f->params_ty) collect_bare(p, out);
+            collect_bare(f->ret_ty, out);
+            return;
+        }
+        case TypeKind::LambdaFunction: {
+            auto f = std::static_pointer_cast<LambdaFunctionType>(r);
+            for (const auto& p : f->params_ty) collect_bare(p, out);
+            for (const auto& c : f->capture_tys) collect_bare(c, out);
+            collect_bare(f->ret_ty, out);
+            return;
+        }
+        case TypeKind::NativeFunction: {
+            auto f = std::static_pointer_cast<NativeFunctionType>(r);
+            for (const auto& p : f->params_ty) collect_bare(p, out);
+            collect_bare(f->ret_ty, out);
+            return;
+        }
+        case TypeKind::Array:
+            collect_bare(std::static_pointer_cast<ArrayType>(r)->type, out); return;
+        case TypeKind::Tuple: {
+            auto f = std::static_pointer_cast<TupleType>(r);
+            for (const auto& e : f->tys) collect_bare(e, out);
+            return;
+        }
+        case TypeKind::Nullable:
+            collect_bare(std::static_pointer_cast<NullableType>(r)->value_type, out); return;
+        case TypeKind::Named: {
+            auto f = std::static_pointer_cast<NamedType>(r);
+            for (const auto& a : f->args) collect_bare(a, out);
+            return;
+        }
+        default: return;
+        }
+    };
+
+    std::unordered_set<TypeVariable*> in_remaining, in_ret;
+    for (const auto& p : remaining_params) collect_bare(p, in_remaining);
+    for (const auto& c : remaining_captures) collect_bare(c, in_remaining);
+    collect_bare(ret_ty, in_ret);
+
+    std::unordered_map<TypeVariable*, std::shared_ptr<TypeVariable>> rename;
+    for (auto* tv : in_remaining) {
+        rename.emplace(tv, type_pool.fresh_type_variable());
+    }
+    for (auto* tv : in_ret) {
+        rename.emplace(tv, type_pool.fresh_type_variable());
+    }
+    if (rename.empty()) return;  // nothing to rename.
+    std::function<std::shared_ptr<Type>(const std::shared_ptr<Type>&)> apply;
+    apply = [&](const std::shared_ptr<Type>& x) -> std::shared_ptr<Type> {
+        if (!x) return nullptr;
+        if (x->kind == TypeKind::TypeVariable) {
+            std::shared_ptr<Type> r = x;
+            while (r && r->kind == TypeKind::TypeVariable) {
+                auto* tv = static_cast<TypeVariable*>(r.get());
+                if (is_recursive_mu_head(tv)) break;  // μ-opaque: stop, don't unroll cycle
+                if (!tv->binding) break;
+                r = tv->binding;
+            }
+            if (r && r->kind == TypeKind::TypeVariable) {
+                auto* root_tv = static_cast<TypeVariable*>(r.get());
+                auto it = rename.find(root_tv);
+                if (it != rename.end()) {
+                    return std::static_pointer_cast<Type>(it->second);
+                }
+                return x;
+            }
+            return apply(r);
+        }
+        switch (x->kind) {
+        case TypeKind::Function: {
+            auto f = std::static_pointer_cast<FunctionType>(x);
+            std::vector<std::shared_ptr<Type>> ps;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(apply(p));
+            auto rt = apply(f->ret_ty);
+            return type_pool.function(std::move(ps), std::move(rt));
+        }
+        case TypeKind::LambdaFunction: {
+            auto f = std::static_pointer_cast<LambdaFunctionType>(x);
+            std::vector<std::shared_ptr<Type>> ps, cs;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(apply(p));
+            cs.reserve(f->capture_tys.size());
+            for (const auto& c : f->capture_tys) cs.push_back(apply(c));
+            auto rt = apply(f->ret_ty);
+            return type_pool.lambda_function(std::move(ps), std::move(rt), std::move(cs));
+        }
+        case TypeKind::NativeFunction: {
+            auto f = std::static_pointer_cast<NativeFunctionType>(x);
+            std::vector<std::shared_ptr<Type>> ps;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(apply(p));
+            auto rt = apply(f->ret_ty);
+            return type_pool.native_function(std::move(ps), std::move(rt), f->name);
+        }
+        case TypeKind::Array:
+            return type_pool.array(apply(std::static_pointer_cast<ArrayType>(x)->type));
+        case TypeKind::Tuple: {
+            auto f = std::static_pointer_cast<TupleType>(x);
+            std::vector<std::shared_ptr<Type>> es;
+            es.reserve(f->tys.size());
+            for (const auto& e : f->tys) es.push_back(apply(e));
+            return type_pool.tuple(std::move(es));
+        }
+        case TypeKind::Nullable:
+            return type_pool.nullable(
+                apply(std::static_pointer_cast<NullableType>(x)->value_type));
+        case TypeKind::Named: {
+            auto f = std::static_pointer_cast<NamedType>(x);
+            std::vector<std::shared_ptr<Type>> as;
+            as.reserve(f->args.size());
+            for (const auto& a : f->args) as.push_back(apply(a));
+            return type_pool.named(f->name, std::move(as));
+        }
+        default: return x;
+        }
+    };
+
+    for (auto& p : remaining_params) p = apply(p);
+    for (auto& c : remaining_captures) c = apply(c);
+    ret_ty = apply(ret_ty);
+}
+
+static void shallow_freshen_tvs(
+    TypePool& type_pool,
+    std::vector<std::shared_ptr<Type>>& params,
+    std::vector<std::shared_ptr<Type>>& captures,
+    std::shared_ptr<Type>& ret_ty
+) noexcept {
+    std::unordered_map<TypeVariable*, std::shared_ptr<TypeVariable>> rename;
+
+    std::function<void(const std::shared_ptr<Type>&)> collect;
+    collect = [&](const std::shared_ptr<Type>& t) {
+        if (!t) return;
+        if (t->kind == TypeKind::TypeVariable) {
+            auto* tv = static_cast<TypeVariable*>(t.get());
+            if (!rename.count(tv)) {
+                rename.emplace(tv, type_pool.fresh_type_variable());
+            }
+            return;
+        }
+        switch (t->kind) {
+        case TypeKind::Function: {
+            auto f = std::static_pointer_cast<FunctionType>(t);
+            for (const auto& p : f->params_ty) collect(p);
+            collect(f->ret_ty);
+            return;
+        }
+        case TypeKind::LambdaFunction: {
+            auto f = std::static_pointer_cast<LambdaFunctionType>(t);
+            for (const auto& p : f->params_ty) collect(p);
+            for (const auto& c : f->capture_tys) collect(c);
+            collect(f->ret_ty);
+            return;
+        }
+        case TypeKind::NativeFunction: {
+            auto f = std::static_pointer_cast<NativeFunctionType>(t);
+            for (const auto& p : f->params_ty) collect(p);
+            collect(f->ret_ty);
+            return;
+        }
+        case TypeKind::Array:
+            collect(std::static_pointer_cast<ArrayType>(t)->type); return;
+        case TypeKind::Tuple: {
+            auto f = std::static_pointer_cast<TupleType>(t);
+            for (const auto& e : f->tys) collect(e);
+            return;
+        }
+        case TypeKind::Nullable:
+            collect(std::static_pointer_cast<NullableType>(t)->value_type); return;
+        case TypeKind::Named: {
+            auto f = std::static_pointer_cast<NamedType>(t);
+            for (const auto& a : f->args) collect(a);
+            return;
+        }
+        default: return;
+        }
+    };
+
+    for (const auto& p : params) collect(p);
+    for (const auto& c : captures) collect(c);
+    collect(ret_ty);
+
+    if (rename.empty()) return;
+
+    std::function<std::shared_ptr<Type>(const std::shared_ptr<Type>&)> apply;
+    apply = [&](const std::shared_ptr<Type>& x) -> std::shared_ptr<Type> {
+        if (!x) return nullptr;
+        if (x->kind == TypeKind::TypeVariable) {
+            auto* tv = static_cast<TypeVariable*>(x.get());
+            auto it = rename.find(tv);
+            if (it != rename.end()) {
+                return std::static_pointer_cast<Type>(it->second);
+            }
+            return x;
+        }
+        switch (x->kind) {
+        case TypeKind::Function: {
+            auto f = std::static_pointer_cast<FunctionType>(x);
+            std::vector<std::shared_ptr<Type>> ps;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(apply(p));
+            auto rt = apply(f->ret_ty);
+            return type_pool.function(std::move(ps), std::move(rt));
+        }
+        case TypeKind::LambdaFunction: {
+            auto f = std::static_pointer_cast<LambdaFunctionType>(x);
+            std::vector<std::shared_ptr<Type>> ps, cs;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(apply(p));
+            cs.reserve(f->capture_tys.size());
+            for (const auto& c : f->capture_tys) cs.push_back(apply(c));
+            auto rt = apply(f->ret_ty);
+            return type_pool.lambda_function(std::move(ps), std::move(rt), std::move(cs));
+        }
+        case TypeKind::NativeFunction: {
+            auto f = std::static_pointer_cast<NativeFunctionType>(x);
+            std::vector<std::shared_ptr<Type>> ps;
+            ps.reserve(f->params_ty.size());
+            for (const auto& p : f->params_ty) ps.push_back(apply(p));
+            auto rt = apply(f->ret_ty);
+            return type_pool.native_function(std::move(ps), std::move(rt), f->name);
+        }
+        case TypeKind::Array:
+            return type_pool.array(apply(std::static_pointer_cast<ArrayType>(x)->type));
+        case TypeKind::Tuple: {
+            auto f = std::static_pointer_cast<TupleType>(x);
+            std::vector<std::shared_ptr<Type>> es;
+            es.reserve(f->tys.size());
+            for (const auto& e : f->tys) es.push_back(apply(e));
+            return type_pool.tuple(std::move(es));
+        }
+        case TypeKind::Nullable:
+            return type_pool.nullable(
+                apply(std::static_pointer_cast<NullableType>(x)->value_type));
+        case TypeKind::Named: {
+            auto f = std::static_pointer_cast<NamedType>(x);
+            std::vector<std::shared_ptr<Type>> as;
+            as.reserve(f->args.size());
+            for (const auto& a : f->args) as.push_back(apply(a));
+            return type_pool.named(f->name, std::move(as));
+        }
+        default: return x;
+        }
+    };
+
+    for (auto& p : params) p = apply(p);
+    for (auto& c : captures) c = apply(c);
+    ret_ty = apply(ret_ty);
+}
+
 void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
     if (!expr) return;
     switch (expr->kind) {
@@ -1156,8 +2897,23 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
             node->type = type_pool.basic(runtime::ValueKind::Expr);
             break;
         }
+        auto handle_adt_constructor = [&](const std::shared_ptr<Type>& ctor_type) -> bool {
+            if (!ctor_type || ctor_type->kind != TypeKind::AdtConstructor) return false;
+            const auto constructor = std::static_pointer_cast<AdtConstructorType>(ctor_type);
+            if (!constructor->fields.empty()) return false;
+            node->is_zero_adt_constructor = true;
+            node->adt_type_name = constructor->type_name;
+            std::vector<std::shared_ptr<Type>> args(constructor->type_params.size(), type_pool.unknown());
+            node->type = type_pool.named(constructor->type_name, std::move(args));
+            return true;
+        };
         if (const auto re = find_var(node->id); re.has_value()) {
-            node->type = (*re)->type;
+            if (handle_adt_constructor((*re)->type)) break;
+            if ((*re)->scheme.has_value()) {
+                node->type = instantiate_scheme(*(*re)->scheme);
+            } else {
+                node->type = (*re)->type;
+            }
             break;
         }
         Scope::Var* resolved = nullptr;
@@ -1178,7 +2934,11 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
                 const auto constructor =
                     std::static_pointer_cast<AdtConstructorType>(resolved->type);
                 if (!constructor->fields.empty()) {
-                    node->type = resolved->type;
+                    if (resolved->scheme.has_value()) {
+                        node->type = instantiate_scheme(*resolved->scheme);
+                    } else {
+                        node->type = resolved->type;
+                    }
                     break;
                 }
                 node->is_zero_adt_constructor = true;
@@ -1189,7 +2949,11 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
                                              std::move(args));
                 break;
             }
-            node->type = resolved->type;
+            if (resolved->scheme.has_value()) {
+                node->type = instantiate_scheme(*resolved->scheme);
+            } else {
+                node->type = resolved->type;
+            }
             node->compiled_symbol = resolved->symbol;
             break;
         }
@@ -1200,6 +2964,17 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
         auto* node = reinterpret_cast<UnaryNode*>(expr.get());
         check_expr(node->expr);
         const auto type = node->expr->type;
+        if (Type::is_null_type(type.get()) ||
+            type->kind == TypeKind::Unknown ||
+            type->kind == TypeKind::None) {
+            node->type = type_pool.unknown();
+            break;
+        }
+        const auto resolved_operand = resolve_hm(type);
+        if (resolved_operand->kind == TypeKind::TypeVariable) {
+            node->type = type_pool.unknown();
+            break;
+        }
         if (type->kind == TypeKind::Dimensioned) {
             if (node->op != UnaryNode::Op::Neg) {
                 throw_error(ErrorType::Analysis, "unary `not` requires bool",
@@ -1240,6 +3015,28 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
         const auto lty = node->lhs->type;
         const auto rty = node->rhs->type;
         if (Type::is_null_type(lty.get()) || Type::is_null_type(rty.get())) break;
+        const auto l_resolved = resolve_hm(lty);
+        const auto r_resolved = resolve_hm(rty);
+        const bool l_is_tv = l_resolved->kind == TypeKind::TypeVariable;
+        const bool r_is_tv = r_resolved->kind == TypeKind::TypeVariable;
+        const bool l_defer  = l_resolved->kind == TypeKind::Unknown || l_resolved->kind == TypeKind::None;
+        const bool r_defer  = r_resolved->kind == TypeKind::Unknown || r_resolved->kind == TypeKind::None;
+        if (l_defer || r_defer) {
+            node->type = type_pool.unknown();
+            break;
+        }
+
+        if (l_is_tv || r_is_tv) {
+            (void)unify_hm(lty, rty);
+            node->lhs->type = deep_resolve(lty);
+            node->rhs->type = deep_resolve(rty);
+            const auto l2 = resolve_hm(node->lhs->type);
+            const auto r2 = resolve_hm(node->rhs->type);
+            if (l2->kind == TypeKind::TypeVariable || r2->kind == TypeKind::TypeVariable) {
+                node->type = type_pool.unknown();
+                break;
+            }
+        }
         if (node->op == BinaryNode::Op::Bind) {
             if (is_expr_type(lty) || is_expr_type(rty)) {
                 if (!is_expr_constructible(lty) || !is_expr_constructible(rty))
@@ -1503,17 +3300,25 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
             }
         }
         {
-        auto operand_type = lty;
-        if (!lty->equals(rty.get())) {
-            if (numeric_rank(lty) >= 0 && numeric_rank(rty) >= 0) {
-                operand_type = unify_interval_bounds(lty, rty);
+        const auto l_resolved = resolve_hm(lty);
+        const auto r_resolved = resolve_hm(rty);
+        if (!l_resolved || !r_resolved ||
+            l_resolved->kind == TypeKind::TypeVariable ||
+            r_resolved->kind == TypeKind::TypeVariable) {
+            node->type = type_pool.unknown();
+            break;
+        }
+        auto operand_type = l_resolved;
+        if (!l_resolved->equals(r_resolved.get())) {
+            if (numeric_rank(l_resolved) >= 0 && numeric_rank(r_resolved) >= 0) {
+                operand_type = unify_interval_bounds(l_resolved, r_resolved);
             } else {
                 throw_error(
                     ErrorType::Analysis,
                     "binary operation type mismatch, (" +
-                    Type::to_string(lty.get()) + " " +
+                    Type::to_string(l_resolved.get()) + " " +
                     BinaryNode::op_to_string(node->op) + " " +
-                    Type::to_string(rty.get()) + ")",
+                    Type::to_string(r_resolved.get()) + ")",
                     expr->line, expr->col);
                 break;
             }
@@ -1530,8 +3335,14 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
         }
         break;
         binary_type_mismatch:
-        throw_error(ErrorType::Analysis, "binary operation cannot applied to this type", expr->line, expr->col);
-        break;
+            node->type = type_pool.unknown();
+            throw_error(
+                ErrorType::Analysis,
+                "binary operation cannot applied to this type",
+                expr->line,
+                expr->col
+            );
+            break;
     }
     case ASTKind::LiteralPayload: {
         const auto node = reinterpret_cast<LiteralPayloadNode*>(expr.get());
@@ -1595,6 +3406,7 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
     }
     case ASTKind::SuffixParen: {
         const auto node = reinterpret_cast<SuffixParenNode*>(expr.get());
+        node->type = type_pool.unknown();
         if (const auto bounds = interval_constructor_bounds(node->expr.get())) {
             const auto standard_module = find_global("std");
             if (standard_module.has_value() &&
@@ -1614,14 +3426,21 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
         }
         if (node->expr->kind == ASTKind::Identifier) {
             const auto id = reinterpret_cast<IdentifierNode*>(node->expr.get());
-            if (const auto found = find_global(id->id);
-                found.has_value() && (*found)->type->kind == TypeKind::AdtConstructor) {
+              if (const auto found = find_global(id->id);
+                found.has_value() && (*found)->type) {
+
+                auto found_type = resolve_hm((*found)->type);
+
+                if (found_type &&
+                    found_type->kind == TypeKind::AdtConstructor) {
                 const auto constructor = std::static_pointer_cast<AdtConstructorType>((*found)->type);
                 if (constructor->fields.size() != node->suffix->exprs.size()) {
+                 //   std::cout <<"field size:\n" << constructor->fields.size();
+                 //   std::cout <<"suffix size:\n" << node->suffix->exprs.size();
                     throw_error(ErrorType::Analysis, "constructor `" + constructor->constructor + "` expects " +
                                 std::to_string(constructor->fields.size()) + " field(s)", node->line, node->col);
                     break;
-                }
+                }       
                 const std::unordered_set<std::string> params(constructor->type_params.begin(), constructor->type_params.end());
                 TypeBindings bindings;
                 for (size_t i = 0; i < node->suffix->exprs.size(); ++i) {
@@ -1640,7 +3459,7 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
                 node->adt_constructor = constructor->constructor;
                 node->type = type_pool.named(constructor->type_name, std::move(args));
                 break;
-            }
+            }}
         }
         if (node->expr->kind == ASTKind::Identifier) {
             const auto id = reinterpret_cast<IdentifierNode*>(node->expr.get());
@@ -1698,7 +3517,8 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
                 std::vector<Scope::Var*> regular_candidates;
                 for (auto& global : global_scope) {
                     if (global.name == id->id &&
-                        global.type->kind == TypeKind::Function)
+                        global.type->kind == TypeKind::Function &&
+                        !global.symbol.empty())
                         regular_candidates.push_back(&global);
                 }
                 if (!regular_candidates.empty()) {
@@ -1764,8 +3584,60 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
             }
         }
         if (!selected_callable) check_expr(node->expr);
-        const auto left = node->expr->type;
+        const auto left = resolve_hm(node->expr->type);
         if (Type::is_null_type(left.get())) break;
+
+        if (left->kind == TypeKind::TypeVariable) {
+            const size_t arity = node->suffix->exprs.size();
+            std::vector<std::shared_ptr<Type>> param_types;
+            param_types.reserve(arity);
+            for (size_t i = 0; i < arity; ++i) {
+                check_expr(node->suffix->exprs[i]);
+                if (!node->suffix->exprs[i]->type) {
+                    node->suffix->exprs[i]->type = std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
+                }
+                param_types.push_back(std::static_pointer_cast<Type>(type_pool.fresh_type_variable()));
+            }
+            auto ret_var = type_pool.fresh_type_variable();
+            auto expected_func = type_pool.lambda_function(
+                std::move(param_types),
+                std::static_pointer_cast<Type>(ret_var),
+                {}
+            );
+            if (!unify_hm(left, expected_func)) {
+                throw_error(ErrorType::Analysis,
+                    "cannot unify type variable with function type at call site",
+                    node->line, node->col);
+                node->type = type_pool.unknown();
+                break;
+            }
+            const auto lf = std::static_pointer_cast<LambdaFunctionType>(resolve_hm(expected_func));
+            bool ok = true;
+            for (size_t i = 0; i < arity && ok; ++i) {
+                const auto ptype = resolve_hm(lf->params_ty[i]);
+                const auto atype = resolve_hm(node->suffix->exprs[i]->type);
+
+                if (!node->suffix->exprs[i]->type) {
+                    node->suffix->exprs[i]->type = ptype;
+                    continue;
+                }
+                if (!type_assignable(lf->params_ty[i], node->suffix->exprs[i]->type)) {
+                    throw_error(ErrorType::Analysis,
+                        "type mismatch arg in call (typevar instantiation) in arg(s) " + std::to_string(i) +
+                        ": (" + Type::to_string(deep_resolve(node->suffix->exprs[i]->type).get()) +
+                        " != " + Type::to_string(deep_resolve(ptype).get()) + ")"
+                        , node->line, node->col);
+                    ok = false;
+                    break;
+                }
+            }
+           if (!ok) {
+                node->type = type_pool.unknown();
+                break;
+            }
+            node->type = lf->ret_ty;
+            break;
+        }
         if (left->kind == TypeKind::AdtConstructor) {
             const auto constructor = std::static_pointer_cast<AdtConstructorType>(left);
             if (constructor->fields.size() != node->suffix->exprs.size()) {
@@ -1790,17 +3662,19 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
             node->type = type_pool.named(constructor->type_name, std::move(args));
         } else if (left->kind == TypeKind::Function) {
             const auto func_ty = std::reinterpret_pointer_cast<FunctionType>(left);
-            if (func_ty->params_ty.size() != node->suffix->exprs.size()) {
+            const size_t given_args = node->suffix->exprs.size();
+            const size_t need_args  = func_ty->params_ty.size();
+            if (given_args > need_args) {
                 throw_error(ErrorType::Analysis,
                     "mismatch args count in function calling, (param(s)"
-                    + std::to_string(func_ty->params_ty.size()) +
+                    + std::to_string(need_args) +
                     " != arg(s)" +
-                    std::to_string(node->suffix->exprs.size()) + ")",
+                    std::to_string(given_args) + ")",
                     node->line, node->col
                     );
                 break;
             }
-            const auto len = func_ty->params_ty.size();
+            const auto len = given_args;
             bool symbolic_fallback = false;
             for (auto i = 0; i < len; i++) {
                 const auto param = func_ty->params_ty[i];
@@ -1809,10 +3683,10 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
                     is_expr_constructible(node->suffix->exprs[i]->type)) {
                     mark_expr_promotion(node->suffix->exprs[i]);
                 }
-                if (contains_unknown_type(node->suffix->exprs[i]->type) &&
-                    type_assignable(param, node->suffix->exprs[i]->type)) {
-                    node->suffix->exprs[i]->type = param;
+                if (!node->suffix->exprs[i]->type) {
+                    node->suffix->exprs[i]->type = std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
                 }
+               
                 if (!type_assignable(param, node->suffix->exprs[i]->type)) {
                     if (node->expr->kind == ASTKind::Identifier &&
                         is_expr_type(node->suffix->exprs[i]->type)) {
@@ -1823,14 +3697,104 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
                     }
                     throw_error(ErrorType::Analysis,
                         "type mismatch arg in function calling in arg(s) " + std::to_string(i) +
-                        ": (" + Type::to_string(node->suffix->exprs[i]->type.get()) +
-                        " != " + Type::to_string(param.get()) + ")"
+                        ": (" + Type::to_string(deep_resolve(node->suffix->exprs[i]->type).get()) +
+                        " != " + Type::to_string(deep_resolve(param).get()) + ")"
                         , node->line, node->col);
                     break;
                 }
             }
             if (symbolic_fallback) break;
-            node->type = std::reinterpret_pointer_cast<FunctionType>(left)->ret_ty;
+
+            if (given_args < need_args) {
+                std::vector<std::shared_ptr<Type>> remaining_params;
+                std::vector<std::shared_ptr<Type>> remaining_captures;  // FunctionKind 无 captures
+                remaining_params.reserve(need_args - given_args);
+                for (size_t i = given_args; i < need_args; ++i) {
+                    remaining_params.push_back(func_ty->params_ty[i]);
+                }
+                auto fresh_ret = func_ty->ret_ty;
+                curry_freshen_intersection_tvs(type_pool, remaining_params, remaining_captures, fresh_ret);
+                node->type = type_pool.lambda_function(
+                    std::move(remaining_params),
+                    std::move(fresh_ret),
+                    {}
+                );
+            } else {
+                auto fresh_ret = std::reinterpret_pointer_cast<FunctionType>(left)->ret_ty;
+                std::vector<std::shared_ptr<Type>> empty_p, empty_c;
+                shallow_freshen_tvs(type_pool, empty_p, empty_c, fresh_ret);
+                node->type = fresh_ret;
+            }
+        } else if (left->kind == TypeKind::LambdaFunction) {
+            const auto func_ty = std::reinterpret_pointer_cast<LambdaFunctionType>(left);
+            const size_t given_args = node->suffix->exprs.size();
+            const size_t need_args  = func_ty->params_ty.size();
+            
+            if (given_args > need_args) {
+                throw_error(ErrorType::Analysis,
+                    "mismatch args count in lambda calling, (param(s)"
+                    + std::to_string(need_args) +
+                    " != arg(s)" +
+                    std::to_string(given_args) + ")",
+                    node->line, node->col
+                    );
+                break;
+            }
+            const auto len = given_args;
+            bool symbolic_fallback = false;
+            for (auto i = 0; i < len; i++) {
+                const auto param = func_ty->params_ty[i];
+                check_expr(node->suffix->exprs[i]);
+
+                if (is_expr_type(param) &&
+                    is_expr_constructible(node->suffix->exprs[i]->type)) {
+                    mark_expr_promotion(node->suffix->exprs[i]);
+                }
+                if (!node->suffix->exprs[i]->type) {
+                    node->suffix->exprs[i]->type = std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
+                }
+                if (!type_assignable(param, node->suffix->exprs[i]->type)) {
+                    if (node->expr->kind == ASTKind::Identifier &&
+                        is_expr_type(node->suffix->exprs[i]->type)) {
+                        node->is_symbolic_call = true;
+                        node->type = type_pool.basic(runtime::ValueKind::Expr);
+                        symbolic_fallback = true;
+                        break;
+                    }
+                    throw_error(ErrorType::Analysis,
+                        "type mismatch arg in lambda calling in arg(s) " + std::to_string(i) +
+                        ": (" + Type::to_string(deep_resolve(node->suffix->exprs[i]->type).get()) +
+                        " != " + Type::to_string(deep_resolve(param).get()) + ")"
+                        , node->line, node->col);
+                    break;
+                }
+            }
+            if (symbolic_fallback) break;
+
+            if (given_args < need_args) {
+                std::vector<std::shared_ptr<Type>> remaining_params;
+                remaining_params.reserve(need_args - given_args);
+                for (size_t i = given_args; i < need_args; ++i) {
+                    remaining_params.push_back(func_ty->params_ty[i]);
+                }
+                std::vector<std::shared_ptr<Type>> remaining_captures;
+                remaining_captures.reserve(func_ty->capture_tys.size());
+                for (const auto& c : func_ty->capture_tys) {
+                    remaining_captures.push_back(c);
+                }
+                auto fresh_ret = func_ty->ret_ty;
+                curry_freshen_intersection_tvs(type_pool, remaining_params, remaining_captures, fresh_ret);
+                node->type = type_pool.lambda_function(
+                    std::move(remaining_params),
+                    std::move(fresh_ret),
+                    std::move(remaining_captures)
+                );
+            } else {
+                auto fresh_ret = std::reinterpret_pointer_cast<LambdaFunctionType>(left)->ret_ty;
+                std::vector<std::shared_ptr<Type>> empty_p, empty_c;
+                shallow_freshen_tvs(type_pool, empty_p, empty_c, fresh_ret);
+                node->type = fresh_ret;
+            }
         } else if (left->kind == TypeKind::NativeFunction) {
             const auto native_symbol = node->adt_constructor;
             new (expr.get()) NativeFuncCallExpr(node);
@@ -1885,10 +3849,17 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
             for (; i < len; i++) {
                 check_expr(node->suffix->exprs[i]);
             }
-
-            node->type = std::reinterpret_pointer_cast<NativeFunctionType>(left)->ret_ty;
+          
+            node->type = deep_resolve(std::reinterpret_pointer_cast<NativeFunctionType>(left)->ret_ty); 
         } else {
-            throw_error(ErrorType::Analysis, "not a function type", node->line, node->col);
+             throw_error(
+                ErrorType::Analysis,
+                "not a function type",
+                node->line,
+                node->col
+            );
+
+            node->type = type_pool.unknown();
             break;
         }
 
@@ -1916,26 +3887,47 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
     case ASTKind::IfExpr: {
         const auto node = reinterpret_cast<IfExprNode*>(expr.get());
         check_expr(node->cond);
-        if (node->cond->type->kind != TypeKind::Basic ||
-            std::reinterpret_pointer_cast<BasicType>(node->cond->type)->type != runtime::ValueKind::Bool) {
+        const auto cond_ty = node->cond->type;
+        const bool cond_unknown = Type::is_null_type(cond_ty.get()) ||
+            cond_ty->kind == TypeKind::Unknown || cond_ty->kind == TypeKind::None;
+        if (!cond_unknown && (node->cond->type->kind != TypeKind::Basic ||
+            std::reinterpret_pointer_cast<BasicType>(node->cond->type)->type != runtime::ValueKind::Bool)) {
             throw_error(ErrorType::Analysis, "must be bool type but got `" + Type::to_string(node->cond->type.get()), node->line, node->col);
             break;
         }
         check_expr(node->then);
         if (node->els) {
             check_expr(node->els);
-            if (node->then->have_ret_value() && node->els->have_ret_value()) {
-                auto unified = unify_types(node->then->type, node->els->type);
+            const bool then_has = node->then->have_ret_value();
+            const bool else_has = node->els->have_ret_value();
+            auto then_ty = node->then->type;
+            auto else_ty = node->els->type;
+            const bool then_null = Type::is_null_type(then_ty.get()) || !then_ty;
+            const bool else_null = Type::is_null_type(else_ty.get()) || !else_ty;
+            if (then_has && else_has && !then_null && !else_null) {
+                // 统一前先把两边 Unknown 替换为 TV，再做 unify
+                auto then_tv = replace_unknowns_with_tvars(then_ty);
+                auto else_tv = replace_unknowns_with_tvars(else_ty);
+                auto unified = unify_types(then_tv, else_tv);
                 if (!unified) {
-                    throw_error(ErrorType::Analysis, "if express then and else cannot type mismatch", node->line, node->col);
+                    throw_error(ErrorType::Analysis,
+                        "if express then and else cannot type mismatch: then=(" +
+                        Type::to_string(deep_resolve(then_tv).get()) + ") vs else=(" +
+                        Type::to_string(deep_resolve(else_tv).get()) + ")",
+                        node->line, node->col);
                     break;
                 }
-                node->type = std::move(unified);
-            } else {
-                node->type = node->then->type;
+                node->type = deep_resolve(std::move(unified));
+                // 统一后把 node->then/else 的类型同步更新，便于上层使用
+                node->then->type = node->type;
+                node->els->type  = node->type;
             }
         } else {
             node->type = node->then->type;
+        }
+        node->type = deep_resolve(replace_unknowns_with_tvars(node->then->type));
+        if (cond_unknown && (!node->type || node->type->kind == TypeKind::Unknown)) {
+            node->type = type_pool.unknown();
         }
         break;
     }
@@ -2334,38 +4326,87 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
         check_expr(node->lhs);
         check_expr(node->rhs);
         std::shared_ptr<ExprNode> result;
+        std::shared_ptr<Type> ret_ty;
+            
+        const auto lhs_ty = resolve_hm(node->lhs->type);
+        const auto rhs_ty = resolve_hm(node->rhs->type);
+        if (!node->lhs->type || !node->rhs->type) {
+            break;
+        }
+        if (rhs_ty->kind == TypeKind::LambdaFunction) {
+            const auto rhs_fty = std::reinterpret_pointer_cast<LambdaFunctionType>(rhs_ty);
+            if (rhs_fty->params_ty.empty()) {
+                throw_error(
+                    ErrorType::Analysis,
+                    "`|>` right lambda requires at least one parameter",
+                    node->line,
+                    node->col
+                );
+                break;
+            }
+            if (!type_assignable(rhs_fty->params_ty.front(), lhs_ty)) {
+                throw_error(
+                    ErrorType::Analysis,
+                    "`|>` lambda first argument type mismatch, ("
+                    + Type::to_string(lhs_ty.get())
+                    + " |> "
+                    + Type::to_string(rhs_fty->params_ty[0].get())
+                    + ")",
+                    node->line,
+                    node->col
+                );
+                break;
+            }
 
-        const auto& lhs_ty = node->lhs->type;
-        const auto& rhs_ty = node->rhs->type;
-        if (rhs_ty == nullptr || rhs_ty->kind != TypeKind::Function) {
-            throw_error(ErrorType::Analysis, "`|>` op not return func on right", node->line, node->col);
-            break;
-        }
-        const auto rhs_fty = std::reinterpret_pointer_cast<FunctionType>(rhs_ty);
-        if (rhs_fty->params_ty.empty()) {
-            throw_error(ErrorType::Analysis, "`|>` op right function calling not arg(1)", node->line, node->col);
-            break;
-        }
-        if (!rhs_fty->params_ty[0]->equals(lhs_ty.get())) {
+            ret_ty = rhs_fty->ret_ty;
+        } else if (rhs_ty->kind == TypeKind::Function) {
+            const auto rhs_fty = std::reinterpret_pointer_cast<FunctionType>(rhs_ty);
+            if (rhs_fty->params_ty.empty()) {
+                throw_error(
+                    ErrorType::Analysis,
+                    "`|>` op right function calling not arg(1)",
+                    node->line,
+                    node->col
+                );
+                break;
+            }
+            if (!type_assignable(rhs_fty->params_ty.front(), lhs_ty)) {
+                throw_error(
+                    ErrorType::Analysis,
+                    "`|>` op in right, function arg type and left type mismatch, ("
+                    + Type::to_string(lhs_ty.get())
+                    + " |> "
+                    + Type::to_string(rhs_fty->params_ty[0].get())
+                    + ")",
+                    node->line,
+                    node->col
+                );
+                break;
+            }
+            ret_ty = rhs_fty->ret_ty;
+        } else {
             throw_error(
                 ErrorType::Analysis,
-                "`|>` op in right, function arg type and left type mismatch, ("
-                + Type::to_string(lhs_ty.get())
-                + " |> "
-                + Type::to_string(rhs_fty->params_ty[0].get())
-                + ")",
-                node->line, node->col
-                );
+                "`|>` op not return func on right",
+                node->line,
+                node->col
+            );
             break;
         }
         decltype(ExprsNode::exprs) exprs;
         exprs.push_back(node->lhs);
         result = std::make_shared<SuffixParenNode>(
-            node->line, node->col, node->rhs,
-            std::make_shared<ExprsNode>(node->line, node->col, exprs)
-            );
-        result->type = rhs_fty->ret_ty;
+            node->line,
+            node->col,
+            node->rhs,
+            std::make_shared<ExprsNode>(
+                node->line,
+                node->col,
+                std::move(exprs)
+            )
+        );
 
+        result->type = deep_resolve(ret_ty);
         expr = result;
         break;
     }
@@ -2402,6 +4443,185 @@ void TypeCkContext::check_expr(std::shared_ptr<ExprNode>& expr) noexcept {
         node->type = tup_ty->tys[node->i];
         break;
     }
+    case ASTKind::LambdaExpr: {
+        const auto node = reinterpret_cast<LambdaExprNode*>(expr.get());
+        if (!node->params || !node->body) {
+            throw_error(ErrorType::Analysis, "invalid lambda expression", node->line, node->col);
+            break;
+        }
+        Scope scope(Scope::ScopeType::Function);
+        scope.name = "@lambda";
+        scope.is_lambda = true;  // 标记为 lambda 作用域
+        node->captured_vars.clear();
+        std::unordered_set<std::string> referenced_names;
+        collect_referenced_identifiers(node->body.get(), referenced_names);
+        std::unordered_set<std::string> param_names;
+        if (node->params) {
+            for (const auto& [pname, _] : node->params->stmts) {
+                param_names.insert(pname);
+            }
+        }
+        auto try_capture = [&](const std::string& name, const std::shared_ptr<Type>& type) {
+            if (referenced_names.count(name) == 0) return;
+            if (param_names.count(name) > 0) return;
+            if (scope.readonly_captured_vars.count(name) > 0) return;
+            scope.readonly_captured_vars.insert(name);
+            if (type && type->kind != TypeKind::NativeFunction)
+            {
+                node->captured_vars.push_back(LambdaExprNode::CapturedVar{name, type});
+            }
+        };
+        for (const auto& s : scope_stack | std::views::reverse) {
+            for (const auto& v : s.vars) {
+                try_capture(v.name, v.type);
+            }
+        }
+        for (const auto& gv : global_scope) {
+            try_capture(gv.name, gv.type);
+        }
+        {
+            std::string pnames;
+            for (const auto& p : param_names) { pnames += p + " "; }
+            std::string cvnames;
+            for (const auto& cv : node->captured_vars) { cvnames += cv.name + " "; }
+        }
+
+        for (auto& [name, ty] : node->params->stmts) {
+            if (!ty || Type::is_null_type(ty.get()) || ty->kind == TypeKind::Unknown) {
+                ty = std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
+            }
+            scope.vars.emplace_back(name, ty, true);
+        }
+        scope_stack.push_back(scope);
+
+        const bool had_err_before_body = errd;
+        errd = false;
+        check_expr(node->body);
+        const bool body_err = errd;
+        errd = had_err_before_body || body_err;
+        if (body_err) {
+            scope_stack.pop_back();
+            node->type = type_pool.unknown();
+            break;
+        }
+        if (node->body->kind == ASTKind::Block) {
+            auto *blk = reinterpret_cast<BlockExprNode*>(node->body.get());
+            const bool has_tail_return =
+                !blk->stmts.empty() && blk->stmts.back() &&
+                blk->stmts.back()->kind == ASTKind::TailReturn;
+            const bool has_any_return = has_explicit_return(node->body.get());
+
+            if (!has_tail_return && !has_any_return &&
+                (Type::is_null_type(scope.return_type.get()) ||
+                 scope.return_type->kind == TypeKind::Unknown ||
+                 scope.return_type->kind == TypeKind::TypeVariable ||
+                 scope.return_type->kind == TypeKind::None)) {
+                auto dummy = make_lambda_dummy_return(node->line, node->col);
+                blk->stmts.push_back(std::make_shared<ReturnNode>(
+                    node->line, node->col, std::move(dummy)));
+                scope_stack.back().return_type = type_pool.basic(runtime::ValueKind::Int);
+            }
+        }
+        scope_stack.pop_back();
+
+        Scope scope2(Scope::ScopeType::Function);
+        scope2.name = "@lambda";
+        scope2.is_lambda = true;
+        scope2.readonly_captured_vars = scope.readonly_captured_vars;
+        for (const auto& [name, ty] : node->params->stmts) {
+            scope2.vars.emplace_back(name, ty, true);
+        }
+        for (const auto& cv : node->captured_vars) {
+            if (cv.type && !Type::is_null_type(cv.type.get())) {
+                scope2.vars.emplace_back(cv.name, cv.type, false);
+            }
+        }
+        for (const auto& s : scope_stack | std::views::reverse) {
+            for (const auto& v : s.vars) {
+                bool dup = false;
+                for (const auto& pv : scope2.vars) {
+                    if (pv.name == v.name) { dup = true; break; }
+                }
+                if (!dup) scope2.vars.emplace_back(v.name, v.type, v.is_mut);
+            }
+        }
+        for (const auto& gv : global_scope) {
+            bool dup = false;
+            for (const auto& pv : scope2.vars) {
+                if (pv.name == gv.name) { dup = true; break; }
+            }
+            if (!dup) scope2.vars.emplace_back(gv.name, gv.type, false);
+        }
+        scope_stack.push_back(scope2);
+        const bool had_err_before_body2 = errd;
+        errd = false;
+        check_expr(node->body);
+        const bool body_err2 = errd;
+        errd = had_err_before_body2 || body_err2;
+        if (body_err2) {
+            scope_stack.pop_back();
+            node->type = type_pool.unknown();
+            break;
+        }
+
+        auto inferred_return = inference_type(node->body.get());
+        const auto& scope_ret = scope_stack.back().return_type;
+
+        const auto is_unresolved = [](const std::shared_ptr<Type>& t) {
+            if (Type::is_null_type(t.get())) return true;
+            if (t->kind == TypeKind::Unknown) return true;
+            if (t->kind == TypeKind::TypeVariable) {
+                auto tv = std::static_pointer_cast<TypeVariable>(t);
+                return !tv->binding;
+            }
+            return t->kind == TypeKind::None;
+        };
+
+        const auto inferred_has_value = !is_unresolved(inferred_return);
+        const auto scope_ret_has_value = !is_unresolved(scope_ret);
+
+        if (inferred_has_value && scope_ret_has_value) {
+            if (!unify_hm(scope_ret, inferred_return)) {
+                throw_error(ErrorType::Analysis,
+                    "lambda return type mismatch: body infers (" +
+                    Type::to_string(deep_resolve(inferred_return).get()) +
+                    ") but return statement gives (" +
+                    Type::to_string(deep_resolve(scope_ret).get()) + ")",
+                    node->line, node->col);
+                scope_stack.pop_back();
+                break;
+            }
+        }
+        auto return_type = inferred_return;
+        if (!inferred_has_value && scope_ret_has_value) {
+            return_type = scope_ret;
+        }
+
+        scope_stack.pop_back();
+
+        decltype(LambdaFunctionType::params_ty) params_ty;
+        for (auto &[name, ty] : node->params->stmts) {
+            if (!ty || Type::is_null_type(ty.get()) || ty->kind == TypeKind::Unknown || ty->kind == TypeKind::None) {
+                ty = std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
+            } else {
+                ty = replace_unknowns_with_tvars(ty);
+            }
+            params_ty.push_back(ty);
+        }
+        decltype(LambdaFunctionType::capture_tys) capture_tys;
+        capture_tys.reserve(node->captured_vars.size());
+        for (auto& cv : node->captured_vars) {
+            if (!cv.type || Type::is_null_type(cv.type.get()) || cv.type->kind == TypeKind::Unknown || cv.type->kind == TypeKind::None) {
+                cv.type = std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
+            } else {
+                cv.type = replace_unknowns_with_tvars(cv.type);
+            }
+            capture_tys.push_back(cv.type);
+        }
+        return_type = replace_unknowns_with_tvars(return_type);
+        node->type = type_pool.lambda_function(std::move(params_ty), return_type, std::move(capture_tys));
+        break;
+    }
     default: std::unreachable();
     }
 }
@@ -2413,7 +4633,7 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
     case ASTKind::ExprStmt: {
         auto* node = reinterpret_cast<ExprStmtNode*>(stmt.get());
         check_expr(node->expr);
-        if (node->expr && contains_unknown_type(node->expr->type))
+        if (node->expr && contains_adt_unknown_args(node->expr->type))
             throw_error(ErrorType::Analysis, "cannot infer ADT type arguments", node->line, node->col);
         break;
     }
@@ -2505,6 +4725,11 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
 
         for (auto& [name, type] : node->params->stmts) type = resolve_type(type);
         node->return_type = resolve_type(node->return_type);
+
+        if (Type::is_null_type(node->return_type.get())) {
+            node->return_type = std::static_pointer_cast<Type>(type_pool.fresh_type_variable());
+        }
+
         new_global_var(node->func_id, node->make_type(), false,
                        node->compiled_symbol);
         auto& ref = global_scope.back();
@@ -2515,20 +4740,82 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
             scope.vars.emplace_back(name, type, true);
         }
         scope_stack.push_back(scope);
-
+        std::shared_ptr<Type> implicit_return;
         if (node->block->kind == ASTKind::Block) {
-            for (auto* block = reinterpret_cast<BlockExprNode*>(node->block.get());
-                auto& s : block->stmts) {
-
+            auto* block = reinterpret_cast<BlockExprNode*>(node->block.get());
+            for (auto& s : block->stmts) {
                 check_stmt(s);
             }
-        } else check_expr(node->block);
+
+            if (!block->stmts.empty()) {
+                auto& last = block->stmts.back();
+                if (last->kind == ASTKind::ExprStmt) {
+                    auto* es = reinterpret_cast<ExprStmtNode*>(last.get());
+                    if (es->expr) implicit_return = es->expr->type;
+                }
+            }
+            if (block->type && !Type::is_null_type(block->type.get())) {
+                implicit_return = block->type;
+            }
+        } else {
+            check_expr(node->block);
+            implicit_return = node->block->type;
+        }
+
+        if (implicit_return && !Type::is_null_type(implicit_return.get())) {
+            implicit_return = replace_unknowns_with_tvars(implicit_return);
+            auto& cur_ret = scope_stack.back().return_type;
+            if (Type::is_null_type(cur_ret.get())) {
+                cur_ret = implicit_return;
+            } else {
+                (void)unify_hm(cur_ret, implicit_return);
+            }
+            cur_ret = resolve_hm(cur_ret);
+        }
+
         if (!node->return_type->equals(scope_stack.back().return_type.get())) {
             node->return_type = scope_stack.back().return_type;
         }
+        if (Type::is_null_type(node->return_type.get()) && implicit_return) {
+            node->return_type = resolve_hm(implicit_return);
+        }
+        node->return_type = resolve_hm(node->return_type);
 
         scope_stack.pop_back();
-        ref.type = node->make_type();
+
+        std::shared_ptr<Type> final_func_type = std::static_pointer_cast<Type>(node->make_type());
+        final_func_type = replace_unknowns_with_tvars(final_func_type);
+        final_func_type = resolve_hm(final_func_type);
+        ref.type = final_func_type;
+
+        std::unordered_set<TypeVariable*> env_free, visited_env;
+        auto collect_scope_vars = [&](const std::vector<Scope::Var>& vars) {
+            for (const auto& v : vars) {
+                if (v.scheme.has_value()) continue;
+                collect_free_type_vars(v.type, env_free, visited_env);
+            }
+        };
+        for (size_t i = 0; i < global_scope.size(); ++i) {
+            if (&global_scope[i] == &ref) continue;
+            if (global_scope[i].scheme.has_value()) continue;
+            collect_free_type_vars(global_scope[i].type, env_free, visited_env);
+        }
+
+        std::unordered_set<TypeVariable*> mono_free, visited_mono;
+        collect_free_type_vars(final_func_type, mono_free, visited_mono);
+        std::vector<TypeVariable*> quantified;
+        for (auto* tv : mono_free) {
+            if (env_free.count(tv) == 0) {
+                quantified.push_back(tv);
+            }
+        }
+        std::optional<TypeScheme> scheme = std::nullopt;
+        if (!quantified.empty()) {
+            auto frozen = freeze_scheme_monotype(final_func_type, quantified);
+            scheme = TypeScheme{std::move(frozen.second), std::move(frozen.first)};
+        }
+        
+        ref.scheme = std::move(scheme);
         break;
     }
     case ASTKind::Return: {
@@ -2546,9 +4833,13 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
                 if (is_expr_type(s.return_type) && is_expr_constructible(node->expr->type))
                     mark_expr_promotion(node->expr);
                 if (!type_assignable(s.return_type, node->expr->type)) {
-                    throw_error(ErrorType::Analysis, "return type mismatch in function `" + s.name + "`", node->line, node->col);
-                    goto return_fail_break;
+                    if (!unify_hm(s.return_type, node->expr->type)) {
+                        throw_error(ErrorType::Analysis, "return type mismatch in function `" + s.name + "`", node->line, node->col);
+                        goto return_fail_break;
+                    }
                 }
+                s.return_type = resolve_hm(s.return_type);
+                break;
             }
         }
         return_fail_break:
@@ -2570,9 +4861,12 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
                 is_expr_constructible(node->expr->type))
                 mark_expr_promotion(node->expr);
             if (!type_assignable(scope_stack.back().return_type, node->expr->type)) {
-                throw_error(ErrorType::Analysis, "return type is inconsistent with the above", node->line, node->col);
-                break;
+                if (!unify_hm(scope_stack.back().return_type, node->expr->type)) {
+                    throw_error(ErrorType::Analysis, "return type is inconsistent with the above", node->line, node->col);
+                    break;
+                }
             }
+            scope_stack.back().return_type = resolve_hm(scope_stack.back().return_type);
         }
         break;
     }
@@ -2586,30 +4880,104 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
         if (is_expr_type(node->type) && node->init_value &&
             node->init_value->kind == ASTKind::SuffixParen)
             reinterpret_cast<SuffixParenNode*>(node->init_value.get())->allow_symbolic_call = true;
+       // std::cout << node->init_value << std::endl;
         check_expr(node->init_value);
+        if (node->init_value && !node->init_value->type) {
+            node->init_value->type = type_pool.unknown();
+        }
+        //std::cout << node->init_value << std::endl;
         if (Type::is_null_type(node->type.get())) {
             if (!node->init_value) {
                 throw_error(ErrorType::Analysis, "the var `" + node->id + "` type not found", node->line, node->col);
                 break;
             } else {
-                node->type = node->init_value->type;
-                if (contains_unknown_type(node->type)) {
+                if (contains_unknown_type(node->init_value->type)) {
+                    throw_error(ErrorType::Analysis, "cannot infer ADT type arguments for `" + node->id + "`", node->line, node->col);
+                    break;
+                }
+                auto tval = replace_unknowns_with_tvars(
+                    node->init_value->type
+                );
+                if (!tval) tval = type_pool.unknown();
+                if (node->type &&
+                    !Type::is_null_type(node->type.get()) &&
+                    node->type->kind != TypeKind::Unknown) {
+
+                    auto declared_ty = replace_unknowns_with_tvars(node->type);
+
+                    if (!unify_hm(declared_ty, tval)) {
+                        throw_error(
+                            ErrorType::Analysis,
+                            "the var `" + node->id +
+                            "` type mismatch with the initialization type",
+                            node->line,
+                            node->col
+                        );
+                        break;
+                    }
+
+                    tval = deep_resolve(declared_ty);
+                }
+
+                node->init_value->type = tval;
+                node->type = tval;
+                if (contains_adt_unknown_args(node->type)) {
                     throw_error(ErrorType::Analysis, "cannot infer ADT type arguments for `" + node->id + "`", node->line, node->col);
                     break;
                 }
             }
         } else {
+            node->init_value->type = replace_unknowns_with_tvars(node->init_value->type);
+            if (!node->init_value->type) {
+                node->init_value->type = type_pool.unknown();
+            }
             if (is_expr_type(node->type) && is_expr_constructible(node->init_value->type)) {
                 mark_expr_promotion(node->init_value);
             } else if (contains_unknown_type(node->init_value->type) &&
                        type_assignable(node->type, node->init_value->type)) {
                 node->init_value->type = node->type;
-            } else if (!type_assignable(node->type, node->init_value->type)) {
+            } else if (!type_assignable(node->type, node->init_value->type) &&
+                       !unify_hm(node->type, node->init_value->type)) {
                 throw_error(ErrorType::Analysis, "the var `" + node->id + "` type mismatch with the initialization type", node->line, node->col);
                 break;
             }
         }
-        new_cur_scope_var(node->id, node->type, node->is_mutable);
+       
+        node->type = resolve_hm(node->type);
+        if (!node->type) node->type = type_pool.unknown();
+        std::unordered_set<TypeVariable*> env_free, visited_env;
+        auto collect_scope_vars = [&](const std::vector<Scope::Var>& vars) {
+            for (const auto& v : vars) {
+                if (v.scheme.has_value()) continue;
+                collect_free_type_vars(v.type, env_free, visited_env);
+            }
+        };
+        collect_scope_vars(global_scope);
+        for (const auto& s : scope_stack) collect_scope_vars(s.vars);
+        std::unordered_set<TypeVariable*> mono_free, visited_mono;
+        collect_free_type_vars(node->type, mono_free, visited_mono);
+        std::vector<TypeVariable*> quantified;
+        for (auto* tv : mono_free) {
+            if (env_free.count(tv) == 0) {
+                quantified.push_back(tv);
+            }
+        }
+        std::optional<TypeScheme> scheme = std::nullopt;
+        if (!quantified.empty()) {
+            auto frozen = freeze_scheme_monotype(node->type, quantified);
+            scheme = TypeScheme{std::move(frozen.second), std::move(frozen.first)};
+        }
+        if (is_global_scope()) {
+            static const std::unordered_set<std::string_view> kWatch = {
+                "zero","succ","add","mul","pair","first","second","t","pred","sub","to_int"
+            };
+          
+        }
+        if (is_global_scope()) {
+            new_global_var_with_scheme(node->id, node->type, scheme, node->is_mutable);
+        } else {
+            new_cur_scope_var_with_scheme(node->id, node->type, scheme, node->is_mutable);
+        }
         break;
     }
     case ASTKind::AssignStmt: {
@@ -2624,7 +4992,8 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
             break;
         } else if (node->lhs->kind == ASTKind::Identifier) {
             const auto id = reinterpret_cast<IdentifierNode*>(node->lhs.get());
-            const auto var = find_var(id->id);
+            auto var = find_var(id->id);
+            if (!var.has_value()) var = find_global(id->id);
             if (!var.has_value()) {
                 throw_error(ErrorType::Analysis, "undefined var `" + id->id + "`", node->line, node->col);
                 break;
@@ -2637,9 +5006,11 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
             throw_error(ErrorType::Analysis, "left side of assignment must be an identifier", node->line, node->col);
             break;
         }
-        if (!node->lhs->type->equals(node->rhs->type.get())) {
+        if (!unify_hm(node->lhs->type, node->rhs->type)) {
             throw_error(ErrorType::Analysis, "assignment type mismatch", node->line, node->col);
         }
+        node->lhs->type = deep_resolve(node->lhs->type);
+        node->rhs->type = deep_resolve(node->rhs->type);
         break;
     }
     case ASTKind::BreakStmt:
@@ -2664,9 +5035,8 @@ void TypeCkContext::check_stmt(std::shared_ptr<StmtNode>& stmt) noexcept {
             if (!Type::is_null_type(node->expr->type.get()) &&
                 !node->expr->type->equals(type_pool.basic(runtime::ValueKind::Int).get())
                 ) {
-
-                throw_error(ErrorType::Analysis, "loop condition type must be int", node->line, node->col);
-                break;
+                    throw_error(ErrorType::Analysis, "loop condition type must be int", node->line, node->col);
+                    break;
                 }
         }
         scope_stack.emplace_back(Scope::ScopeType::Loop);
@@ -2702,7 +5072,18 @@ void TypeCkContext::new_global_var(std::string name, std::shared_ptr<Type> type,
                               std::move(symbol), is_export);
 }
 
+void TypeCkContext::new_cur_scope_var_with_scheme(std::string name, std::shared_ptr<Type> type,
+    std::optional<TypeScheme> scheme, bool is_mut) noexcept {
+    Scope::Var var{std::move(name), std::move(type), is_mut, {}, true, std::move(scheme)};
+    scope_stack.back().vars.push_back(std::move(var));
+}
+
+void TypeCkContext::new_global_var_with_scheme(std::string name, std::shared_ptr<Type> type,
+    std::optional<TypeScheme> scheme, bool is_mut) noexcept {
+    Scope::Var var{std::move(name), std::move(type), is_mut, {}, true, std::move(scheme)};
+    global_scope.push_back(std::move(var));
+}
+
 std::vector<Scope::Var> &TypeCkContext::get_global() noexcept {
     return global_scope;
 }
-

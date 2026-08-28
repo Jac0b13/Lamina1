@@ -1,0 +1,49 @@
+import std
+
+let zero  = |f| -> |x| -> x
+let succ  = |n| -> |f| -> |x| -> f(n(f)(x))
+let add   = |m| -> |n| -> |f| -> |x| -> m(f)(n(f)(x))
+let mul   = |m| -> |n| -> |f| -> m(n(f))
+let pair  = |a| -> |b| -> |selector| -> selector(a)(b)
+let first = |p| -> p(|a| -> |b| -> a)
+let second= |p| -> p(|a| -> |b| -> b)
+let t     = |p| -> pair(second(p))(succ(second(p)))
+let pred  = |n| -> first(n(t)(pair(zero)(zero)))
+let sub   = |m| -> |n| -> n(pred)(m)
+
+let to_int = |n| -> n(|a| -> a + 1)(0)
+
+func from_int(n int) {
+    if (n == 0) {
+        zero
+    } else {
+        succ(from_int(n - 1))
+    }
+}
+
+# Church numerals
+let c0   = from_int(0)
+let c114 = from_int(114)
+let c514 = from_int(514)
+let c91  = from_int(91)
+let c78  = from_int(78)
+let c25  = from_int(25)
+let c4   = from_int(4)
+
+# pred 0
+let result_pred_0 = pred(c0)
+std.printf("pred 0       = %lld\n", to_int(result_pred_0))
+
+# pred 114
+let result_pred_114 = pred(c114)
+std.printf("pred 114     = %lld\n", to_int(result_pred_114))
+
+# 114 + 514
+let result_add = add(c114)(c514)
+std.printf("114 + 514    = %lld\n", to_int(result_add))
+
+# 91 - 78
+let result_sub = sub(c91)(c78)
+std.printf("91 - 78      = %lld\n", to_int(result_sub))
+let result_mul = mul(c25)(c4)
+std.printf("25 * 4       = %lld\n", to_int(result_mul))

@@ -195,6 +195,25 @@ public:
         }
         return true;
     }
+
+    static bool load_closure_layouts(decltype(CodeModuleObj::closure_layouts)& result, const uint8_t*& p) noexcept {
+        const auto over = p + *reinterpret_cast<const uint64_t*>(p) + sizeof(uint64_t);
+        p += sizeof(uint64_t);
+        if (p == over) return true;
+        const uint64_t entry_count = *reinterpret_cast<const uint64_t*>(p);
+        p += sizeof(uint64_t);
+        result.reserve(static_cast<size_t>(entry_count));
+        for (uint64_t i = 0; i < entry_count; ++i) {
+            if (p + sizeof(uint32_t) > over) return false;
+            const uint32_t esz = *reinterpret_cast<const uint32_t*>(p);
+            p += sizeof(uint32_t);
+            if (p + esz > over) return false;
+            std::vector<uint8_t> entry(p, p + esz);
+            p += esz;
+            result.push_back(std::move(entry));
+        }
+        return true;
+    }
 };
 }
 
@@ -216,6 +235,7 @@ CodeModuleObj::CodeModuleObj(std::vector<uint8_t>&& data) : Object(ObjectKind::C
     ModuleLoader::load_cp(cp, binary);
     ModuleLoader::load_native_decl(native_funcs, native_lib_handle, binary);
     ModuleLoader::load_imports(imports, binary);
+    ModuleLoader::load_closure_layouts(closure_layouts, binary);
     ModuleLoader::load_entry_code(code, code_len, binary);
 }
 
@@ -286,6 +306,7 @@ constexpr InstInfo INST_TABLE[] = {
     /* GGet       */ {.name = "gget",      .fmt = InstInfo::RegImm16},
     /* GSet       */ {.name = "gset",      .fmt = InstInfo::RegImm16},
     /* FAdd       */ {.name = "fadd",      .fmt = InstInfo::RegRegReg},
+    /* FPow       */ {.name = "fpow",      .fmt = InstInfo::RegRegReg},
     /* FSub       */ {.name = "fsub",      .fmt = InstInfo::RegRegReg},
     /* FMul       */ {.name = "fmul",      .fmt = InstInfo::RegRegReg},
     /* FDiv       */ {.name = "fdiv",      .fmt = InstInfo::RegRegReg},

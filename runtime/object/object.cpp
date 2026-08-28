@@ -16,6 +16,7 @@
 #include "sparse.hpp"
 #include "tensor.hpp"
 #include "assumptions.hpp"
+#include "closure.hpp"
 
 using namespace lmx::runtime;
 
@@ -85,13 +86,28 @@ uint32_t Object::get_kind() const noexcept {
 }
 
 Object *Object::get() noexcept {
+    __asm__ __volatile__ ("" ::: "memory");
     rc++;
+    __asm__ __volatile__ ("" ::: "memory");
     return this;
 }
 
 void Object::release() noexcept {
-    if (--rc <= 0) {
-        switch (kind) {
+    if (this == nullptr) return;
+    __asm__ __volatile__ ("" ::: "memory");
+    const uint32_t cur_rc = rc;
+    __asm__ __volatile__ ("" ::: "memory");
+    if (cur_rc == 0u || cur_rc >= 0xFFFFFFF0u) return;
+    const uint32_t new_rc = cur_rc - 1u;
+    __asm__ __volatile__ ("" ::: "memory");
+    rc = new_rc;
+    __asm__ __volatile__ ("" ::: "memory");
+    if (new_rc == 0u) {
+        const uint32_t saved_kind = kind;
+        __asm__ __volatile__ ("" ::: "memory");
+        rc = 0xFFFFFFFFu;
+        kind = 0xFFFFFFFFu;
+        switch (saved_kind) {
         case ObjectKind::Object: {
             delete this;
             return;
@@ -157,6 +173,10 @@ void Object::release() noexcept {
         case ObjectKind::Assumptions:
             delete reinterpret_cast<AssumptionsObj*>(this);
             return;
+        case ObjectKind::Closure: {
+            delete static_cast<ClosureObj*>(this);
+            return;
+        }
         default:
             return;
         }

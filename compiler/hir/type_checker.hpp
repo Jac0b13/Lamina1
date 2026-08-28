@@ -7,6 +7,17 @@
 namespace lmx::hir {
 
 using HirNode = ASTNode;
+std::shared_ptr<Type> resolve_hm(const std::shared_ptr<Type>& type) noexcept;
+bool occurs_check(const std::shared_ptr<Type>& var, const std::shared_ptr<Type>& in_type) noexcept;
+bool unify_hm(const std::shared_ptr<Type>& lhs, const std::shared_ptr<Type>& rhs) noexcept;
+std::shared_ptr<Type> deep_resolve(const std::shared_ptr<Type>& type) noexcept;
+std::shared_ptr<Type> replace_unknowns_with_tvars(const std::shared_ptr<Type>& type) noexcept;
+void collect_free_type_vars(
+    const std::shared_ptr<Type>& type,
+    std::unordered_set<TypeVariable*>& free_vars,
+    std::unordered_set<TypeVariable*>& visited
+) noexcept;
+std::shared_ptr<Type> instantiate_scheme(const TypeScheme& scheme) noexcept;
 
 struct ResolvedModule {
     std::string source_path;
@@ -52,9 +63,15 @@ class TypeCkContext {
     void new_global_var(std::string name, std::shared_ptr<Type> type, bool is_mut = false,
                         std::string symbol = {}, bool is_export = true) noexcept;
 
+    void new_cur_scope_var_with_scheme(std::string name, std::shared_ptr<Type> type,
+        std::optional<TypeScheme> scheme, bool is_mut = false) noexcept;
+    void new_global_var_with_scheme(std::string name, std::shared_ptr<Type> type,
+        std::optional<TypeScheme> scheme, bool is_mut = false) noexcept;
+
     std::vector<Scope::Var> &get_global() noexcept;
 
     [[nodiscard]] bool is_global_scope() const noexcept;
+
 public:
     explicit TypeCkContext(ModuleResolver* module_resolver = nullptr) noexcept;
 

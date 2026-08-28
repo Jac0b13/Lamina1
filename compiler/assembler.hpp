@@ -37,6 +37,14 @@ class RegAllocator {
 public:
     std::optional<uint8_t> alloc() noexcept;
     void free(uint8_t reg) noexcept;
+    void mark_used(uint8_t reg) noexcept {
+        if (reg == 0 || reg > COMMON_REG_COUNT) return;
+        regs.set(reg - 1);
+    }
+    bool is_used(uint8_t reg) const noexcept {
+        if (reg == 0 || reg > COMMON_REG_COUNT) return false;
+        return regs.test(reg - 1);
+    }
     std::vector<uint8_t> get_all_using() noexcept;
 };
 
@@ -66,6 +74,7 @@ public:
     };
 
     std::unordered_map<std::string, Val> vals;
+    std::unordered_map<std::string, GlobalVar> globals;
     std::unordered_map<std::string, size_t> funcs; // func name -> index
     std::unordered_map<std::string, size_t> native_funcs; // ^
     std::unordered_map<std::string, std::pair<size_t, std::shared_ptr<ModuleType>>> imports;      // name -> index, ty
@@ -82,6 +91,7 @@ public:
     uint16_t write_cp_arr(uint8_t elem_tag, const std::vector<std::vector<uint8_t>>& elems);
 
     std::optional<Val*> find_var(const std::string& name) noexcept;
+    std::optional<GlobalVar*> find_global(const std::string& name) noexcept;
 
     static void write_u32(std::vector<uint8_t>& buf, uint32_t value) noexcept;
     static void write_u64(std::vector<uint8_t>& buf, uint64_t value) noexcept;

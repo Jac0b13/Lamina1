@@ -8,13 +8,21 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace lmx {
 struct Type;
+struct TypeVariable;
+struct TypeScheme;
 struct NativeFuncDeclNode;
 struct TypeDeclNode;
+
+struct TypeScheme {
+    std::vector<TypeVariable*> quantified;
+    std::shared_ptr<Type> monotype;
+};
 
 namespace hir {
 struct Scope {
@@ -24,6 +32,7 @@ struct Scope {
         bool is_mut;
         std::string symbol;
         bool is_export{true};
+        std::optional<TypeScheme> scheme = std::nullopt;
     };
     enum class ScopeType {
         Function, Block, Loop
@@ -32,12 +41,13 @@ struct Scope {
     std::string name;
     std::vector<Var> vars;
     std::shared_ptr<Type> return_type;
+    bool is_lambda{false};
+
+    std::unordered_set<std::string> readonly_captured_vars;
 
     explicit Scope(std::string name) noexcept;
     explicit Scope(ScopeType scope) noexcept;
     explicit Scope() = default;
-
-
 
 };
 }
@@ -72,12 +82,15 @@ enum class ASTKind {
     TupleGetExpr,
     UnitAnnotated,
     UnitDecl,
+    LambdaExpr,
 };
 
 enum class TypeKind {
     Basic, Array, Named, Unknown, Never, String, Function, None, NativeFunction,
-    Module, AdtConstructor, Nullable, Tuple, Dimensioned
+    Module, AdtConstructor, Nullable, Tuple, Dimensioned, LambdaFunction, TypeVariable
 };
+
+
 struct Type {
     TypeKind kind;
 
@@ -254,6 +267,20 @@ struct NamedType : Type {
     bool equals(Type *other) const noexcept override;
 };
 
+struct LambdaFunctionType : Type {
+    friend class TypePool;
+
+    std::vector<std::shared_ptr<Type>> params_ty;
+    std::shared_ptr<Type> ret_ty;
+    std::vector<std::shared_ptr<Type>> capture_tys;
+private:
+    explicit LambdaFunctionType(std::vector<std::shared_ptr<Type>> params_ty,
+                                std::shared_ptr<Type> ret_ty,
+                                std::vector<std::shared_ptr<Type>> capture_tys = {}) noexcept;
+public:
+    bool equals(Type *other) const noexcept override;
+};
+
 struct NullableType : Type {
     std::shared_ptr<Type> value_type;
 
@@ -273,6 +300,25 @@ struct AdtConstructorType : Type {
                        std::vector<std::string> type_params,
                        std::vector<std::shared_ptr<Type>> fields) noexcept;
     bool equals(Type *other) const noexcept override;
+};
+
+struct TypeVariable : Type {
+    friend class TypePool;
+
+    uint64_t id;
+    std::shared_ptr<Type> binding;
+
+    bool equals(Type *other) const noexcept override {
+        if (is_null_type(other)) return false;
+        if (this == other) return true;
+        if (other->kind != TypeKind::TypeVariable) return false;
+        const auto* o = static_cast<const TypeVariable*>(other);
+        return id == o->id;
+    }
+
+private:
+    explicit TypeVariable(uint64_t id) noexcept
+        : Type(TypeKind::TypeVariable), id(id) {}
 };
 
 struct ArrayType : Type {
@@ -651,6 +697,20 @@ struct PipeExprNode : ExprNode {
         : ExprNode(ASTKind::PipeExpr, line, col), lhs(std::move(lhs)), rhs(std::move(rhs)) {};
 };
 
+struct LambdaExprNode : ExprNode {
+    std::shared_ptr<ParamsDeclNode> params;
+    std::shared_ptr<ExprNode> body;
+
+    struct CapturedVar {
+        std::string name;
+        std::shared_ptr<Type> type;
+    };
+    std::vector<CapturedVar> captured_vars;
+
+    LambdaExprNode(size_t line, size_t col, std::shared_ptr<ParamsDeclNode> params, std::shared_ptr<ExprNode> body) noexcept
+        : ExprNode(ASTKind::LambdaExpr, line, col), params(std::move(params)), body(std::move(body)) {};
+};
+
 struct ArrayLiteralNode : ExprNode {
     std::vector<std::shared_ptr<ExprNode>> exprs;
 
@@ -727,6 +787,7 @@ struct Module {
  */
 class TypePool {
     std::vector<std::shared_ptr<Type>> types;
+    uint64_t next_type_var_id{0};
 public:
     [[nodiscard]] std::shared_ptr<Type> basic(runtime::ValueKind v) noexcept;
     [[nodiscard]] std::shared_ptr<Type> dimensioned(UnitSpec syntax) noexcept;
@@ -758,6 +819,11 @@ public:
     [[nodiscard]] std::shared_ptr<Type> none() noexcept;
 
     std::shared_ptr<Type> tuple(std::vector<std::shared_ptr<Type>> t) noexcept;
+    [[nodiscard]] std::shared_ptr<Type> lambda_function(std::vector<std::shared_ptr<Type>> params,
+                                                        std::shared_ptr<Type> ret,
+                                                        std::vector<std::shared_ptr<Type>> capture_tys = {}) noexcept;
+
+    [[nodiscard]] std::shared_ptr<TypeVariable> fresh_type_variable() noexcept;
 };
 
 extern TypePool type_pool;

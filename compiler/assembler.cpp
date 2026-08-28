@@ -3,11 +3,55 @@
 #include "lmx.h"
 
 #include <algorithm>
+#include <iostream>
 #include <assert.h>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string_view>
 #include <ranges>
+#include <unordered_map>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace lmx {
+
+
+static std::unordered_map<std::string, std::string> g_lifted_lambda_vars;
+
+static std::unordered_map<std::string, std::string> active_lifted_lambda_vars;
+
+static std::vector<std::vector<uint8_t>> g_closure_layouts;
+
+bool is_lambda_create_expr(const std::shared_ptr<mir::MirExpr>& expr, std::string* lambda_name = nullptr, bool* has_caps = nullptr) noexcept {
+    if (!expr || expr->kind != mir::MirExprKind::Operate) return false;
+    const auto* op = reinterpret_cast<const mir::MirOperateExpr*>(expr.get());
+    if (op->opcode != runtime::Opcode::FuncCreate) return false;
+    const auto* fc = reinterpret_cast<const mir::MirFuncCreateExpr*>(op);
+    if (lambda_name) *lambda_name = fc->func_name;
+    if (has_caps) *has_caps = !fc->cap_names.empty();
+    return fc->func_name.rfind("@lambda_", 0) == 0;
+}
+
+static std::optional<uint16_t> resolve_lifted_lambda_func_idx(
+    const std::unordered_map<std::string, std::string>& active_table,
+    const std::unordered_map<std::string, std::string>& global_table,
+    const std::unordered_map<std::string, size_t>& funcs,
+    const std::string& name) noexcept {
+    const auto resolve = [&](const auto& table) -> std::optional<uint16_t> {
+        const auto lit = table.find(name);
+        if (lit == table.end()) return std::nullopt;
+        const auto fit = funcs.find(lit->second);
+        if (fit == funcs.end()) return std::nullopt;
+        return static_cast<uint16_t>(fit->second);
+    };
+    if (const auto idx = resolve(active_table)) return idx;
+    if (const auto idx = resolve(global_table)) return idx;
+    return std::nullopt;
+}
+
 std::vector<uint8_t> RegAllocator::get_all_using() noexcept {
     std::vector<uint8_t> rs;
     rs.reserve(COMMON_REG_COUNT);
@@ -186,6 +230,11 @@ std::optional<Assembler::Val*> Assembler::find_var(const std::string& name) noex
     return std::nullopt;
 }
 
+std::optional<Assembler::GlobalVar*> Assembler::find_global(const std::string& name) noexcept {
+    const auto it = globals.find(name);
+    if (it == globals.end()) return std::nullopt;
+    return &it->second;
+}
 
 uint16_t Assembler::write_cp_frac(const int32_t num, const int32_t frac) {
     using namespace lmx::runtime;
@@ -256,12 +305,41 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
         if (const auto v_opt = find_var(e->name)) {
             const auto& v = *v_opt;
             if (v->kind == Val::Kind::Reg) {
-                return v->reg;
+                // #region debug-point A:ref-reg-reuse
+                
+                // #endregion
+                const auto r = *reg.alloc();
+                InstEmitter::emit(insts, runtime::Opcode::MovRR, r, v->reg);
+                return r;
             }
             const auto r = *reg.alloc();
+            // Var kind – emit LGet to load from local variable (captures/params/locals 优先)
             InstEmitter::emit(insts, runtime::Opcode::LGet, r, v->var);
             return r;
         }
+        if (const auto g_opt = find_global(e->name)) {
+            const auto global_idx = (*g_opt)->idx;
+            const auto r = *reg.alloc();
+            InstEmitter::emit(insts, runtime::Opcode::GGet, r, global_idx);
+            return r;
+        }
+        auto resolve_lambda_alias = [&](const std::string& name) -> std::optional<uint8_t> {
+            auto resolve = [&](const auto& table) -> std::optional<uint8_t> {
+                const auto lit = table.find(name);
+                if (lit == table.end()) return std::nullopt;
+                // #region debug-point E:lambda-alias-hit
+                // #endregion
+                const auto fit = funcs.find(lit->second);
+                if (fit == funcs.end()) return std::nullopt;
+                const auto r = *reg.alloc();
+                InstEmitter::emit(insts, runtime::Opcode::GetFunc, r, static_cast<uint16_t>(fit->second));
+                return r;
+            };
+            if (const auto r = resolve(active_lifted_lambda_vars)) return r;
+            if (const auto r = resolve(g_lifted_lambda_vars)) return r;
+            return std::nullopt;
+        };
+        if (const auto r = resolve_lambda_alias(e->name)) return *r;
         if (const auto v_opt = funcs.find(e->name); v_opt != funcs.end()) {
             const auto func_idx = static_cast<uint16_t>(v_opt->second);
             const auto r = *reg.alloc();
@@ -449,6 +527,7 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
 
         case runtime::Opcode::FAdd:
         case runtime::Opcode::FSub:
+        case runtime::Opcode::FPow:
         case runtime::Opcode::FMul:
         case runtime::Opcode::FDiv:
         case runtime::Opcode::FMod:
@@ -482,6 +561,71 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
             const auto rd = *reg.alloc();
             InstEmitter::emit(insts, runtime::Opcode::FNeg, rd, r);
             reg.free(r);
+            return rd;
+        }
+        case runtime::Opcode::FuncCreate: {
+            const auto& fc = *reinterpret_cast<mir::MirFuncCreateExpr*>(node);
+            std::string resolved = fc.func_name;
+            if (const auto it = active_lifted_lambda_vars.find(fc.func_name);
+                it != active_lifted_lambda_vars.end()) {
+                resolved = it->second;
+            } else if (const auto it = g_lifted_lambda_vars.find(fc.func_name);
+                       it != g_lifted_lambda_vars.end()) {
+                resolved = it->second;
+            }
+            const auto it_f = funcs.find(resolved);
+            const uint16_t func_idx = static_cast<uint16_t>(it_f != funcs.end() ? it_f->second : 0);
+            std::vector<uint8_t> cap_slots;
+            cap_slots.reserve(fc.cap_names.size());
+            for (const auto& cname : fc.cap_names) {
+                if (const auto v_it = find_var(cname); v_it.has_value()) {
+                    const Val* v = v_it.value();
+                    if (v->kind == Val::Kind::Var) {
+                        cap_slots.push_back(v->var);
+                        continue;
+                    }
+                    const auto slot = next_local_var++;
+                    InstEmitter::emit(insts, runtime::Opcode::LSet, v->reg, slot);
+                    cap_slots.push_back(slot);
+                    continue;
+                }
+                if (const auto alias_func_idx = resolve_lifted_lambda_func_idx(
+                        active_lifted_lambda_vars, g_lifted_lambda_vars, funcs, cname);
+                    alias_func_idx.has_value()) {
+                    const auto rr = *reg.alloc();
+                    InstEmitter::emit(insts, runtime::Opcode::GetFunc, rr, *alias_func_idx);
+                    const auto slot = next_local_var++;
+                    InstEmitter::emit(insts, runtime::Opcode::LSet, rr, slot);
+                    reg.free(rr);
+                    cap_slots.push_back(slot);
+                    continue;
+                }
+                if (const auto g_it = find_global(cname); g_it.has_value()) {
+                    const auto rr = *reg.alloc();
+                    InstEmitter::emit(insts, runtime::Opcode::GGet, rr, (*g_it)->idx);
+                    const auto slot = next_local_var++;
+                    InstEmitter::emit(insts, runtime::Opcode::LSet, rr, slot);
+                    reg.free(rr);
+                    cap_slots.push_back(slot);
+                    continue;
+                }
+             
+                cap_slots.push_back(0);
+            }
+
+            std::vector<uint8_t> layout;
+            layout.reserve(3 + cap_slots.size());
+            layout.push_back(static_cast<uint8_t>(func_idx & 0xFF));
+            layout.push_back(static_cast<uint8_t>((func_idx >> 8) & 0xFF));
+            layout.push_back(static_cast<uint8_t>(cap_slots.size()));
+            for (uint8_t s : cap_slots) layout.push_back(s);
+            const uint16_t layout_idx = static_cast<uint16_t>(g_closure_layouts.size());
+            g_closure_layouts.push_back(std::move(layout));
+
+            const auto rd = *reg.alloc();
+            // #region debug-point E:funccreate-emit
+            // #endregion
+            InstEmitter::emit(insts, runtime::Opcode::FuncCreate, rd, layout_idx);
             return rd;
         }
 
@@ -530,10 +674,15 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
 
         case runtime::Opcode::CallFast: {
             const auto& c = *reinterpret_cast<mir::MirCallFastExpr*>(node);
-
-
+            std::string resolved_name = c.name;
+            if (const auto it = active_lifted_lambda_vars.find(c.name);
+                it != active_lifted_lambda_vars.end()) {
+                resolved_name = it->second;
+            } else if (const auto it = g_lifted_lambda_vars.find(c.name);
+                       it != g_lifted_lambda_vars.end()) {
+                resolved_name = it->second;
+            }
             const auto argc = static_cast<uint8_t>(c.args.size());
-            // Evaluate each arg and place in regs[255 - i]
             for (size_t i = 0; i < c.args.size(); ++i) {
                 const auto rr = asm_mir_expr(insts, c.args[i].get());
                 if (rr != static_cast<uint8_t>(LMX_VM_REG_COUNT - 1 - i)) {
@@ -543,10 +692,9 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
                 reg.free(rr);
             }
 
-            const auto func_it = funcs.find(c.name);
+            const auto func_it = funcs.find(resolved_name);
             if (func_it == funcs.end()) return 0;
             const auto func_idx = static_cast<uint16_t>(func_it->second);
-
             InstEmitter::emit(insts, runtime::Opcode::CallFast, func_idx, argc);
 
             return 0;
@@ -574,7 +722,35 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
             const auto& c = *reinterpret_cast<mir::MirCallExpr*>(node);
 
             const auto argc = static_cast<uint8_t>(c.args.size());
-            // Evaluate each arg and place in regs[255 - i]
+
+            auto func_it = asm_mir_expr(insts, c.func.get());
+            // #region debug-point A:call-reg-state
+            // #endregion
+            if (func_it != 0 && !reg.is_used(func_it)) {
+                reg.mark_used(func_it);
+            }
+            {
+                const auto safe = *reg.alloc();
+                InstEmitter::emit(insts, runtime::Opcode::MovRR, safe, func_it);
+                if (func_it != 0 && !reg.is_used(func_it)) {
+                } else if (func_it != 0) {
+                    // func_it was previously owner-less; our mark prevents double-free
+                    // Do not actually free since it wasn't allocated via reg.alloc
+                    // (Safe to leave marked; it will be freed implicitly at func asm reset)
+                }
+                func_it = safe;
+            }
+
+            for (size_t i = 0; i < c.args.size(); ++i) {
+                const uint8_t target = static_cast<uint8_t>(LMX_VM_REG_COUNT - 1 - i);
+                if (func_it == target) {
+                    const auto safe2 = *reg.alloc();
+                    InstEmitter::emit(insts, runtime::Opcode::MovRR, safe2, func_it);
+                    reg.free(func_it);
+                    func_it = safe2;
+                }
+            }
+
             for (size_t i = 0; i < c.args.size(); ++i) {
                 const auto rr = asm_mir_expr(insts, c.args[i].get());
                 if (rr != static_cast<uint8_t>(LMX_VM_REG_COUNT - 1 - i)) {
@@ -584,10 +760,7 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
                 reg.free(rr);
             }
 
-            const auto func_it = asm_mir_expr(insts, c.func.get());
-
             InstEmitter::emit(insts, runtime::Opcode::Call, func_it, argc);
-
 
             reg.free(func_it);
             return 0;
@@ -621,8 +794,15 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
             if (!attr_idx) return 0;
 
             const auto r = *reg.alloc();
-            InstEmitter::emit(insts, runtime::Opcode::MovRR, static_cast<uint8_t>(0), mod_reg->reg);
-            reg.free(mod_reg->reg);
+            if (mod_reg->kind == Val::Kind::Var) {
+                const auto t = *reg.alloc();
+                InstEmitter::emit(insts, runtime::Opcode::LGet, t, mod_reg->var);
+                InstEmitter::emit(insts, runtime::Opcode::MovRR, static_cast<uint8_t>(0), t);
+                reg.free(t);
+            } else {
+                InstEmitter::emit(insts, runtime::Opcode::MovRR, static_cast<uint8_t>(0), mod_reg->reg);
+                reg.free(mod_reg->reg);
+            }
             InstEmitter::emit(insts, runtime::Opcode::GetModuleAttr, r, static_cast<uint16_t>(*attr_idx));
             return r;
             break;
@@ -727,36 +907,114 @@ void Assembler::asm_mir_node(InstEmitter::InstSeq& result, mir::MirNode* node) n
     case mir::MirNodeKind::TempAssign: {
         const auto n = reinterpret_cast<mir::MirTempAssign*>(node);
         auto r = asm_mir_expr(result, n->expr.get());
+        bool is_call_result = false;
+        if (r == 0 && n->expr && n->expr->kind == mir::MirExprKind::Operate) {
+            const auto* op = reinterpret_cast<const mir::MirOperateExpr*>(n->expr.get());
+            is_call_result = (op->opcode == runtime::Opcode::CallFast) ||
+                             (op->opcode == runtime::Opcode::Call) ||
+                             (op->opcode == runtime::Opcode::CCall);
+        }
         if (const auto found = find_var(n->name);
             found.has_value()) {
-            if ((*found)->reg != r) {
-                InstEmitter::emit(result, runtime::Opcode::MovRR, (*found)->reg, r);
-                reg.free(r);
+            const uint8_t src_reg = (r != 0) ? r : static_cast<uint8_t>(0);
+            if ((*found)->kind == Val::Kind::Var) {
+                InstEmitter::emit(result, runtime::Opcode::LSet, src_reg, (*found)->var);
+            } else {
+                if ((*found)->reg != src_reg) {
+                    InstEmitter::emit(result, runtime::Opcode::MovRR, (*found)->reg, src_reg);
+                }
             }
+            if (r != 0) reg.free(r);
         } else {
-            if (r == 0) {
-                r = *reg.alloc();
-                InstEmitter::emit(result, runtime::Opcode::MovRR, r, uint8_t{0});
+            const uint8_t src_reg = (r != 0) ? r : static_cast<uint8_t>(0);
+            if (r == 0 && is_call_result) {
+                const auto var_idx = next_local_var++;
+                vals[n->name] = Val(var_idx);
+                InstEmitter::emit(result, runtime::Opcode::LSet, src_reg, var_idx);
+            } else {
+                if (r == 0) {
+                    const auto dst_reg = *reg.alloc();
+                    InstEmitter::emit(result, runtime::Opcode::MovRR, dst_reg, uint8_t{0});
+                    const auto var_idx = next_local_var++;
+                    vals[n->name] = Val(var_idx);
+                    InstEmitter::emit(result, runtime::Opcode::LSet, dst_reg, var_idx);
+                    reg.free(dst_reg);
+                } else {
+                    const auto var_idx = next_local_var++;
+                    vals[n->name] = Val(var_idx);
+                    InstEmitter::emit(result, runtime::Opcode::LSet, src_reg, var_idx);
+                    reg.free(src_reg);
+                }
+                // #region debug-point A:tempassign-reg-owner
+                // #endregion
             }
-            vals[n->name] = Val(r, true);
         }
         break;
     }
 
     case mir::MirNodeKind::Assign: {
         const auto n = reinterpret_cast<mir::MirAssign*>(node);
-        const auto r = asm_mir_expr(result, n->expr.get());
 
+        std::string lambda_name;
+        bool has_caps = false;
+        if (is_lambda_create_expr(n->expr, &lambda_name, &has_caps)) {
+            if (!has_caps) {
+                active_lifted_lambda_vars[n->name] = lambda_name;
+                const auto r = asm_mir_expr(result, n->expr.get());
+                if (r != 0) reg.free(r);
+                break;
+            }
+        }
+
+        const auto r = asm_mir_expr(result, n->expr.get());
+        bool is_call_result = false;
+        if (r == 0 && n->expr && n->expr->kind == mir::MirExprKind::Operate) {
+            const auto* op = reinterpret_cast<const mir::MirOperateExpr*>(n->expr.get());
+            is_call_result = (op->opcode == runtime::Opcode::CallFast) ||
+                             (op->opcode == runtime::Opcode::Call) ||
+                             (op->opcode == runtime::Opcode::CCall);
+        }
+        if (r == 0 && !is_call_result) {
+            break;
+        }
+        const uint8_t src_reg = (r != 0) ? r : static_cast<uint8_t>(0);
+
+        const auto g_opt = find_global(n->name);
         const auto v_opt = find_var(n->name);
-        if (!v_opt) {
+
+        if (!v_opt && g_opt) {
+            InstEmitter::emit(result, runtime::Opcode::GSet, src_reg, (*g_opt)->idx);
+        } else if (!v_opt) {
+            // New variable – allocate a local var slot
             const auto var_idx = next_local_var++;
             vals[n->name] = Val(var_idx);
-            InstEmitter::emit(result, runtime::Opcode::LSet, r, var_idx);
+            InstEmitter::emit(result, runtime::Opcode::LSet, src_reg, var_idx);
         } else {
-            const auto& v = *v_opt;
-            InstEmitter::emit(result, runtime::Opcode::LSet, r, v->var);
+            auto& v = **v_opt;
+
+            if (v.kind == Val::Kind::Var) {
+                InstEmitter::emit(
+                    result,
+                    runtime::Opcode::LSet,
+                    src_reg,
+                    v.var
+                );
+            } else {
+                if (v.reg != src_reg) {
+                    InstEmitter::emit(
+                        result,
+                        runtime::Opcode::MovRR,
+                        v.reg,
+                        src_reg
+                    );
+                }
+            }
+            if (g_opt) {
+                InstEmitter::emit(result, runtime::Opcode::GSet, src_reg, (*g_opt)->idx);
+            }
         }
-        reg.free(r);
+
+        if (r != 0) reg.free(r);
         break;
     }
 
@@ -809,6 +1067,15 @@ std::vector<uint8_t> Assembler::asm_func(mir::MirFuncDefine* def) noexcept {
     label_positions.clear();
     pending_fixups.clear();
     next_local_var = 0;
+    active_lifted_lambda_vars.clear();
+    for (const auto& body_node : def->body) {
+        if (!body_node || body_node->kind != mir::MirNodeKind::Assign) continue;
+        const auto* a = reinterpret_cast<const mir::MirAssign*>(body_node.get());
+        std::string lambda_name;
+        if (is_lambda_create_expr(a->expr, &lambda_name)) {
+            active_lifted_lambda_vars[a->name] = lambda_name;
+        }
+    }
 
     InstEmitter::InstSeq insts;
     insts.reserve(128);
@@ -883,6 +1150,9 @@ std::vector<uint8_t> Assembler::asm_module(mir::MirModule* mod) noexcept {
     std::vector<uint8_t> result;
     result.reserve(512);
 
+    g_closure_layouts.clear();
+
+    // Magic number
     write_u32(result, LMX_MAGIC_NUM);
     write_u32(result, LMX_VERSION);
 
@@ -912,6 +1182,7 @@ std::vector<uint8_t> Assembler::asm_module(mir::MirModule* mod) noexcept {
 
     funcs.clear();
     native_funcs.clear();
+    g_lifted_lambda_vars.clear();
     cp.clear();
     imports.clear();
     cp_cnt = 0;
@@ -936,15 +1207,40 @@ std::vector<uint8_t> Assembler::asm_module(mir::MirModule* mod) noexcept {
             encode_native_funcs.push_back({.name = f->symbol, .arg_ty = f->params, .ret_ty = f->ret_ty});
         }
         else {
+            if (node->kind == mir::MirNodeKind::Assign) {
+                const auto *a = reinterpret_cast<const mir::MirAssign*>(node.get());
+                if (a->expr && a->expr->kind == mir::MirExprKind::Operate) {
+                    const auto *op = reinterpret_cast<const mir::MirOperateExpr*>(a->expr.get());
+                    if (op->opcode == runtime::Opcode::FuncCreate) {
+                        const auto *fc = reinterpret_cast<const mir::MirFuncCreateExpr*>(op);
+                        if (fc->func_name.rfind("@lambda_", 0) == 0 && fc->cap_names.empty()) {
+                            g_lifted_lambda_vars[a->name] = fc->func_name;
+                        }
+                    }
+                }
+            }
             top_level_nodes.push_back(node);
         }
     }
-
+    // Compile top-level code as the entry point
     vals.clear();
+    globals.clear();
+    uint8_t slot = 0;
+    for (auto& node : top_level_nodes) {
+        if (node->kind != mir::MirNodeKind::Assign) continue;
+        const auto* a = reinterpret_cast<const mir::MirAssign*>(node.get());
+        bool has_caps = false;
+        if (is_lambda_create_expr(a->expr, nullptr, &has_caps) && !has_caps) continue;
+        if (vals.count(a->name)) continue;
+        vals[a->name] = Val(slot);
+        slot++;
+    }
+    next_local_var = slot;
+
     reg = RegAllocator{};
     label_positions.clear();
     pending_fixups.clear();
-    next_local_var = 0;
+    active_lifted_lambda_vars.clear();
 
     InstEmitter::InstSeq entry_insts;
     for (auto& n : top_level_nodes) {
@@ -1019,6 +1315,24 @@ std::vector<uint8_t> Assembler::asm_module(mir::MirModule* mod) noexcept {
     result.insert(result.end(), import_data.begin(), import_data.end());
 
 
+    std::vector<uint8_t> closure_sec;
+    for (auto& e : g_closure_layouts) {
+        const uint32_t esz = static_cast<uint32_t>(e.size());
+        closure_sec.push_back(static_cast<uint8_t>(esz & 0xFF));
+        closure_sec.push_back(static_cast<uint8_t>((esz >> 8) & 0xFF));
+        closure_sec.push_back(static_cast<uint8_t>((esz >> 16) & 0xFF));
+        closure_sec.push_back(static_cast<uint8_t>((esz >> 24) & 0xFF));
+        closure_sec.insert(closure_sec.end(), e.begin(), e.end());
+    }
+    const uint64_t entry_count = g_closure_layouts.size();
+    write_u64(result, sizeof(entry_count) + closure_sec.size());
+    for (size_t i = 0; i < sizeof(entry_count); ++i) {
+        result.push_back(static_cast<uint8_t>((entry_count >> (i * 8)) & 0xFF));
+    }
+    result.insert(result.end(), closure_sec.begin(), closure_sec.end());
+
+
+    // ---- Write entry code section (after constants, loaded as prog->code) ----
     write_u64(result, entry_code.size());
     result.insert(result.end(), entry_code.begin(), entry_code.end());
     result.shrink_to_fit();

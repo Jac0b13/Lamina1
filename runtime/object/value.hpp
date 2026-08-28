@@ -346,6 +346,10 @@ LMX_INLINE Value::~Value() noexcept {
         if (this->obj) this->obj->release();
         break;
     }
+    case ValueKind::Fraction: {
+        frac_val.~Fraction();
+        break;
+    }
     default:{}
     }
     kind = ValueKind::Null;

@@ -126,6 +126,35 @@ void AstPrinter::print_type(std::ostringstream &ss, const Type &type) {
         ss << constructor.type_name << "." << constructor.constructor;
         break;
     }
+    case TypeKind::LambdaFunction: {
+        auto &lt = static_cast<const LambdaFunctionType &>(type);
+        ss << "lambda func(";
+        for (size_t i = 0; i < lt.params_ty.size(); i++) {
+            if (i > 0) ss << ", ";
+            if (lt.params_ty[i]) print_type(ss, *lt.params_ty[i]);
+        }
+        ss << ")";
+        if (lt.ret_ty) {
+            ss << " -> ";
+            print_type(ss, *lt.ret_ty);
+        }
+        break;
+    }
+    case TypeKind::TypeVariable: {
+        auto &tv = static_cast<const TypeVariable &>(type);
+        if (tv.binding) {
+            print_type(ss, *tv.binding);
+        } else {
+            char letter = 'A' + (tv.id % 26);
+            uint64_t suffix = tv.id / 26;
+            if (suffix == 0) {
+                ss << letter;
+            } else {
+                ss << letter << suffix;
+            }
+        }
+        break;
+    }
     }
 }
 

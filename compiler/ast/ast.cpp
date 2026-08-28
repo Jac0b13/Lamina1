@@ -187,6 +187,46 @@ std::shared_ptr<Type> TypePool::tuple(std::vector<std::shared_ptr<Type>> t) noex
     return tup_tmp_ty;
 }
 
+LambdaFunctionType::LambdaFunctionType(std::vector<std::shared_ptr<Type>> params_ty,
+                                       std::shared_ptr<Type> ret_ty,
+                                       std::vector<std::shared_ptr<Type>> capture_tys) noexcept
+    : Type(TypeKind::LambdaFunction), params_ty(std::move(params_ty)), ret_ty(std::move(ret_ty)), capture_tys(std::move(capture_tys)) {
+}
+
+bool LambdaFunctionType::equals(Type *other) const noexcept {
+    if (is_null_type(other)) return false;
+    if (other->kind != this->kind) return false;
+    const auto *o = static_cast<const LambdaFunctionType *>(other);
+    if (params_ty.size() != o->params_ty.size() || capture_tys.size() != o->capture_tys.size()) return false;
+    if (!ret_ty->equals(o->ret_ty.get())) return false;
+    for (size_t i = 0; i < params_ty.size(); i++) {
+        if (!params_ty[i]->equals(o->params_ty[i].get())) return false;
+    }
+    for (size_t i = 0; i < capture_tys.size(); i++) {
+        if (!capture_tys[i]->equals(o->capture_tys[i].get())) return false;
+    }
+    return true;
+}
+
+std::shared_ptr<Type> TypePool::lambda_function(std::vector<std::shared_ptr<Type>> params,
+                                                std::shared_ptr<Type> ret,
+                                                std::vector<std::shared_ptr<Type>> capture_tys) noexcept {
+    for (const auto& t : types)
+        if (t->kind == TypeKind::LambdaFunction) {
+            const auto* f = static_cast<LambdaFunctionType*>(t.get());
+            if (!f->ret_ty->equals(ret.get()) || f->params_ty.size() != params.size() || f->capture_tys.size() != capture_tys.size()) continue;
+            bool ok = true;
+            for (size_t i = 0; i < params.size(); i++)
+                if (!f->params_ty[i]->equals(params[i].get())) { ok = false; break; }
+            for (size_t i = 0; i < capture_tys.size(); i++)
+                if (!f->capture_tys[i]->equals(capture_tys[i].get())) { ok = false; break; }
+            if (ok) return t;
+        }
+    auto ty = std::shared_ptr<Type>(new LambdaFunctionType(std::move(params), std::move(ret), std::move(capture_tys)));
+    types.push_back(ty);
+    return ty;
+}
+
 Type::~Type() = default;
 
 BasicType::~BasicType() = default;
@@ -587,4 +627,11 @@ SymDeclNode::SymDeclNode(size_t line, size_t col, std::vector<std::string> ids) 
     : StmtNode(ASTKind::SymDecl, line, col), ids(std::move(ids)) {}
 
 ArrayLiteralNode::ArrayLiteralNode(const size_t line, const size_t col, decltype(exprs) exprs) noexcept
-    : ExprNode(ASTKind::ArrayLiteral, line, col), exprs(std::move(exprs)) {}
+    : ExprNode(ASTKind::ArrayLiteral, line, col), exprs(std::move(exprs)) {
+}
+
+std::shared_ptr<TypeVariable> TypePool::fresh_type_variable() noexcept {
+    auto ty = std::shared_ptr<TypeVariable>(new TypeVariable(next_type_var_id++));
+    types.push_back(std::static_pointer_cast<Type>(ty));
+    return ty;
+}

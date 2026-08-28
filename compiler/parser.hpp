@@ -46,6 +46,7 @@ class Parser {
     std::shared_ptr<ExprNode> parse_pipe() noexcept;
     std::shared_ptr<ExprNode> parse_arrow() noexcept;
     std::shared_ptr<ExprNode> parse_set_literal() noexcept;
+    std::shared_ptr<ExprNode> parse_lambda() noexcept;
     std::shared_ptr<ExprNode> parse_parenthesized_expression() noexcept;
 
     [[nodiscard]] Token& cur() const noexcept;

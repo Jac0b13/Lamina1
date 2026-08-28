@@ -58,6 +58,13 @@ public:
     const uint8_t* code{};
     size_t code_len{};
     std::vector<uint8_t> raw_data{};
+    // Closure 布局表：FuncCreate 通过 layout_idx 索引这里。
+    // 每个 layout 格式：
+    //   [0-1]  func_idx(uint16_t, little-endian)
+    //   [2]    cap_count(uint8_t)
+    //   [3..3+cap_count-1]  outer frame capture slot indices (uint8_t[])
+    std::vector<std::vector<uint8_t>> closure_layouts;
+
     explicit CodeModuleObj(std::vector<uint8_t>&& data);
     ~CodeModuleObj() noexcept;
 

@@ -24,6 +24,7 @@ enum {
     Sparse,
     Tensor,
     Assumptions,
+    Closure,
 };
 }
 class Object {
@@ -32,14 +33,12 @@ class Object {
 public:
     explicit Object(uint32_t kind) noexcept;
 
-    ~Object() noexcept;
+    virtual ~Object() noexcept;
 
     [[nodiscard]] uint32_t get_kind() const noexcept;
 
-
     [[nodiscard]] Object*       get() noexcept;
     void release() noexcept;
-
     [[nodiscard]] uint32_t get_rc() const noexcept {
         return rc;
     }

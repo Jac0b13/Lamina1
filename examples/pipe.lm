@@ -12,6 +12,11 @@ func println_int(n int) {
 }
 
 let foo_ref = foo
+let lambda = |x| -> x + 1
+let lambda2 = |y| -> y + 1
+func nn(n int){
+    n + 78
+}
 printf("%lld\n",
     4
     |> foo_ref
@@ -21,3 +26,4 @@ printf("%lld\n",
     |> println_int(2)
 )
 printf("%.1f\n", io.bar()(5))
+printf("lambda:%d\n", 1 |> lambda |> lambda2 |> nn)
