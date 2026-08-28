@@ -61,13 +61,12 @@ public:
         enum class Kind { Var, Reg};
         Kind kind;
         bool is_tmp;
-        union {
-            uint8_t reg;
-            uint8_t var;
-        };
-        Val() noexcept : kind(Kind::Reg), is_tmp(false), reg(0) {}
+        // reg 与 var 按 Kind 二选一使用；var 为 16 位槽号（LGet/LSet 以 u16 编码）。
+        uint8_t reg;
+        uint16_t var;
+        Val() noexcept : kind(Kind::Reg), is_tmp(false), reg(0), var(0) {}
         explicit Val(uint8_t reg, bool is_tmp) noexcept;
-        explicit Val(uint8_t var) noexcept;
+        explicit Val(uint16_t var) noexcept;
     };
     struct GlobalVar {
         uint16_t idx;
@@ -101,7 +100,7 @@ public:
 
     std::unordered_map<std::string, size_t> label_positions;
     std::vector<PendingFixup> pending_fixups;
-    uint8_t next_local_var;
+    uint16_t next_local_var;
 
     std::vector<uint8_t> asm_func(mir::MirFuncDefine* def) noexcept;
     uint8_t asm_mir_expr(InstEmitter::InstSeq& result, mir::MirExpr* node) noexcept;
