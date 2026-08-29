@@ -6,9 +6,6 @@
 #include <cstdlib>
 #include <fstream>
 #include <string_view>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include "object/fraction.hpp"
