@@ -17,7 +17,7 @@
 
 namespace lmx::runtime {
 
-#define LMX_LOCAL_VAR_COUNT 4096
+#define LMX_LOCAL_VAR_COUNT 256
 #define LMX_CALLSTACK_MAX_COUNT 4096
 #define LMX_VM_REG_COUNT 256
 #define LMX_GLOBAL_VAR_COUNT 65536
@@ -27,8 +27,6 @@ struct Frame {
     CodeModuleObj* mod;
     const uint8_t* ret_addr;
     Value local_vars[LMX_LOCAL_VAR_COUNT];
-    // 本帧实际写过的最高槽位（高水位），pop 时只清理这些槽，避免整帧 memset。
-    uint32_t locals_used{0};
     explicit Frame(Frame* last, CodeModuleObj* mod, const uint8_t* ret_addr) noexcept;
     ~Frame() noexcept;
 };
@@ -145,15 +143,12 @@ public:
             frame->last = vm->cur_frame;
             frame->mod = mod;
             frame->ret_addr = ret_addr;
-            frame->locals_used = 0;
             vm->cur_frame = frame;
         }
     }
     friend LMX_INLINE const uint8_t *pop_frame(LaminaVM* vm) noexcept {
         auto* cur_frame = vm->cur_frame;
-        for (uint32_t i = 0; i < cur_frame->locals_used; ++i) {
-            cur_frame->local_vars[i] = Value{};
-        }
+        for (auto& local : cur_frame->local_vars) local = Value{};
         vm->free_frames.push_back(cur_frame);
         vm->cur_frame = cur_frame->last;
 

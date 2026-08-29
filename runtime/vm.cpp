@@ -285,9 +285,6 @@ std::expected<Value, std::string> LaminaVM::invoke(
     for (std::size_t i = 0; i < arguments.size(); ++i) {
         cur_frame->local_vars[i] = arguments[i];
     }
-    if (const auto used = static_cast<uint32_t>(arguments.size()); used > cur_frame->locals_used) {
-        cur_frame->locals_used = used;
-    }
     regs = callback_regs;
     ++invoke_depth;
     try {
@@ -497,14 +494,11 @@ Value LaminaVM::execute(const uint8_t* ip, Frame* stop_frame) {
     VM_LABEL(CallFast) {
         const auto* func = &cur_frame->mod->funcs[read_u16(ip + 1)];
         // #region debug-point B:callfast-layout
-
+     
         // #endregion
         new_frame(this, func->mod, ip + 4);
         for (uint8_t i = 0; i < ip[3]; ++i) {
             cur_frame->local_vars[i] = regs[LMX_VM_REG_COUNT - 1 - i];
-        }
-        if (const uint32_t used = ip[3]; used > cur_frame->locals_used) {
-            cur_frame->locals_used = used;
         }
 
         regs += LMX_VM_REG_COUNT;
@@ -577,14 +571,12 @@ Value LaminaVM::execute(const uint8_t* ip, Frame* stop_frame) {
     }
 
     VM_LABEL(LGet) {
-        regs[ip[1]] = cur_frame->local_vars[read_u16(ip + 2)];
+        regs[ip[1]] = cur_frame->local_vars[ip[2]];
         VM_NEXT
     }
 
     VM_LABEL(LSet) {
-        const auto slot = read_u16(ip + 2);
-        if (slot >= cur_frame->locals_used) cur_frame->locals_used = slot + 1;
-        cur_frame->local_vars[slot] = regs[ip[1]];
+        cur_frame->local_vars[ip[2]] = regs[ip[1]];
         VM_NEXT
     }
 
@@ -674,10 +666,6 @@ Value LaminaVM::execute(const uint8_t* ip, Frame* stop_frame) {
         }
         for (uint8_t i = 0; i < user_argc; ++i) {
             cur_frame->local_vars[cap_count + i] = regs[LMX_VM_REG_COUNT - 1 - i];
-        }
-        if (const uint32_t used = static_cast<uint32_t>(cap_count) + user_argc;
-            used > cur_frame->locals_used) {
-            cur_frame->locals_used = used;
         }
 
         regs += LMX_VM_REG_COUNT;
