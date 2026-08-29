@@ -17,7 +17,7 @@
 #endif
 
 #define LMX_MAGIC_NUM   ((uint32_t)0x434D4C00)
-#define LMX_VERSION     ((uint32_t)0x00000001)
+#define LMX_VERSION     ((uint32_t)0x00000002)
 
 #define LMX_INLINE __attribute__((always_inline)) inline
 #if __cplusplus
