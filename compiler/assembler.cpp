@@ -196,10 +196,10 @@ void RegAllocator::free(const uint8_t reg) noexcept {
 
 
 Assembler::Val::Val(const uint8_t reg, const bool is_tmp) noexcept
-    : kind(Kind::Reg), is_tmp(is_tmp), reg(reg), var(0) {}
+    : kind(Kind::Reg), is_tmp(is_tmp), reg(reg) {}
 
-Assembler::Val::Val(const uint16_t var) noexcept
-    : kind(Kind::Var), is_tmp(false), reg(0), var(var) {}
+Assembler::Val::Val(const uint8_t var) noexcept
+    : kind(Kind::Var), is_tmp(false), var(var) {}
 
 
 void Assembler::write_u32(std::vector<uint8_t>& buf, const uint32_t value) noexcept {
@@ -581,13 +581,12 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
                 if (const auto v_it = find_var(cname); v_it.has_value()) {
                     const Val* v = v_it.value();
                     if (v->kind == Val::Kind::Var) {
-                        // 闭包布局中捕获槽固定为 1 字节；函数帧槽号始终很小。
-                        cap_slots.push_back(static_cast<uint8_t>(v->var));
+                        cap_slots.push_back(v->var);
                         continue;
                     }
                     const auto slot = next_local_var++;
                     InstEmitter::emit(insts, runtime::Opcode::LSet, v->reg, slot);
-                    cap_slots.push_back(static_cast<uint8_t>(slot));
+                    cap_slots.push_back(slot);
                     continue;
                 }
                 if (const auto alias_func_idx = resolve_lifted_lambda_func_idx(
@@ -598,7 +597,7 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
                     const auto slot = next_local_var++;
                     InstEmitter::emit(insts, runtime::Opcode::LSet, rr, slot);
                     reg.free(rr);
-                    cap_slots.push_back(static_cast<uint8_t>(slot));
+                    cap_slots.push_back(slot);
                     continue;
                 }
                 if (const auto g_it = find_global(cname); g_it.has_value()) {
@@ -607,7 +606,7 @@ uint8_t Assembler::asm_mir_expr(InstEmitter::InstSeq& insts, mir::MirExpr* node)
                     const auto slot = next_local_var++;
                     InstEmitter::emit(insts, runtime::Opcode::LSet, rr, slot);
                     reg.free(rr);
-                    cap_slots.push_back(static_cast<uint8_t>(slot));
+                    cap_slots.push_back(slot);
                     continue;
                 }
              
@@ -1226,7 +1225,7 @@ std::vector<uint8_t> Assembler::asm_module(mir::MirModule* mod) noexcept {
     // Compile top-level code as the entry point
     vals.clear();
     globals.clear();
-    uint16_t slot = 0;
+    uint8_t slot = 0;
     for (auto& node : top_level_nodes) {
         if (node->kind != mir::MirNodeKind::Assign) continue;
         const auto* a = reinterpret_cast<const mir::MirAssign*>(node.get());
